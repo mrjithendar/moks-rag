@@ -10,8 +10,8 @@ spec:
   sources:
     - repoURL: https://qdrant.github.io/qdrant-helm
       chart: qdrant
-      # Semver range tracks 1.x chart releases; pin an exact version (e.g. "1.13.6") for strict immutability.
-      targetRevision: "1.*"
+      # Pinned to the chart mk4 ran on 2026-11-26 (Qdrant v1.20.2). Upgrade by changing it here.
+      targetRevision: "1.20.2"
       helm:
         releaseName: qdrant
         valueFiles:

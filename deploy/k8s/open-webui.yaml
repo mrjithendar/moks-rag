@@ -114,6 +114,24 @@ data:
                 js.write_text(txt, encoding="utf-8")
 
     print(f"[subpath-patch] done: prefix={prefix}, patched_ne={patched_ne}, patched_ws={patched_ws}")
+
+    # Verify the result instead of trusting the counters (a restart of the same container finds files patched
+    # already). If this build's frontend no longer matches, refuse to start: a crash-looping pod is visible in
+    # Argo CD, a /chat that silently loads nothing is not.
+    problems = []
+    if index_path.exists() and marker not in index_path.read_text(encoding="utf-8"):
+        problems.append("index.html has no subpath shim")
+    if immutable.exists():
+        texts = [p.read_text(encoding="utf-8", errors="ignore") for p in immutable.rglob("*.js")]
+        if not any(f'"{prefix}/ws/socket.io"' in t for t in texts):
+            problems.append("no bundle uses the prefixed Socket.IO path")
+        if not any(f'="{prefix}"+' in t for t in texts):
+            problems.append("SvelteKit URL resolver was not patched")
+    else:
+        problems.append(f"{immutable} not found")
+    if problems:
+        print("[subpath-patch] FAILED: " + "; ".join(problems), file=sys.stderr)
+        sys.exit(1)
 ---
 # Uses `local-path` because Hetzner CSI (`hcloud-volumes`) enforces a 10Gi minimum volume size.
 # Switch to `hcloud-volumes` (and bump to 10Gi) if you prefer node-portable persistence.
@@ -159,19 +177,30 @@ spec:
       enableServiceLinks: false
       containers:
         - name: open-webui
-          image: ghcr.io/open-webui/open-webui:main
+          # Pinned to the digest mk4 ran on 2026-11-26 (multi-arch index). patch_subpath.py rewrites this build's
+          # minified frontend; after an upgrade it refuses to start if the patch no longer applies.
+          image: ghcr.io/open-webui/open-webui:main@sha256:ff7f7cbb4545aacec2c22d085b2bc406b299c119bd98747421124a1a6c03795f
           imagePullPolicy: IfNotPresent
           command: ["/bin/sh", "-c"]
           args:
-            - python3 /patches/patch_subpath.py /chat && exec bash /app/backend/start.sh
+            - export OPENAI_API_KEY="${OPEN_WEBUI_RAG_TOKEN:-$OPENAI_API_KEY}"; python3 /patches/patch_subpath.py /chat && exec bash /app/backend/start.sh
           env:
             - name: OPENAI_API_BASE_URL
               value: "http://rag-api.rag.svc.cluster.local:8000/v1"
+            # rag-api token: OPEN_WEBUI_RAG_TOKEN (read-only, scripts/issue-service-token.sh open-webui) when it
+            # exists, else the shared token. Open WebUI keeps connection settings in its database once they are
+            # saved in Admin -> Settings -> Connections; then update the key there too (README "Access").
             - name: OPENAI_API_KEY
               valueFrom:
                 secretKeyRef:
                   name: rag-secrets
                   key: RAG_BEARER_TOKEN
+            - name: OPEN_WEBUI_RAG_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: rag-secrets
+                  key: OPEN_WEBUI_RAG_TOKEN
+                  optional: true
             - name: WEBUI_SECRET_KEY
               valueFrom:
                 secretKeyRef:
