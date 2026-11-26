@@ -74,7 +74,7 @@ spec:
             - name: ENABLE_SIGNUP
               value: "false"
             - name: WEBUI_URL
-              value: "https://chat.jithendar.com"
+              value: "https://jithendar.com/chat"
             - name: DATA_DIR
               value: "/app/backend/data"
           ports:

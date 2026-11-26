@@ -1,10 +1,15 @@
 # Istio routing and zero-trust mesh policies for the `rag` namespace on Hetzner k3s.
 #
 # Cluster Edge Gateway integration (k8s-deployments/deploy/minikube/istio/edge/values.yaml):
-#   1. Under `gateway.https`, add:
-#        - rag/chat.jithendar.com
-#   2. Under `root.delegates`, add:
-#        - {name: rag, prefix: /rag, to: rag/rag-api}
+#   Under `root.delegates`, add:
+#     - {name: rag, prefix: /rag, to: rag/rag-api}
+#     - {name: chat, prefix: /chat, to: rag/open-webui}
+#
+# Note on Open WebUI subpath (`/chat`):
+#   The upstream `ghcr.io/open-webui/open-webui:main` SvelteKit bundle compiles with `base: ""`
+#   (root-absolute `/_app/...`, `/static/...`, `/api/...`, `/ws/socket.io/...`). If assets 404
+#   under `/chat`, either build Open WebUI with SvelteKit `paths.base = "/chat"` or redirect
+#   `/chat` -> `https://chat.jithendar.com` in `istio-edge` (matching Harbor's `/harbor` redirect).
 #
 # Strictly internal services (`bge-m3`, `qdrant`, `docling-serve`, `litellm`) have NO VirtualService
 # and are exposed via ClusterIP only.
@@ -35,8 +40,8 @@ spec:
             port:
               number: 8000
 ---
-# Standalone VirtualService for https://chat.jithendar.com -> open-webui:80
-# Attaches directly to the existing cluster gateway (`istio-ingress/public`, wildcard cert *.jithendar.com).
+# Delegate VirtualService for https://jithendar.com/chat -> open-webui:80
+# Owned via delegation from `istio-ingress/jithendar-com` (no hosts/gateways fields).
 # No timeout field so SSE chat streaming and WebSockets are not truncated.
 apiVersion: networking.istio.io/v1
 kind: VirtualService
@@ -47,15 +52,20 @@ metadata:
     app: open-webui
     app.kubernetes.io/part-of: rag
 spec:
-  hosts:
-    - chat.jithendar.com
-  gateways:
-    - istio-ingress/public
   http:
-    - name: open-webui
+    - name: open-webui-exact
       match:
         - uri:
-            prefix: /
+            exact: /chat
+      redirect:
+        uri: /chat/
+        redirectCode: 308
+    - name: open-webui-prefix
+      match:
+        - uri:
+            prefix: /chat/
+      rewrite:
+        uri: /
       route:
         - destination:
             host: open-webui.rag.svc.cluster.local
