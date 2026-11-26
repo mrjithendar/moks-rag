@@ -18,6 +18,10 @@ _FENCE_RE = re.compile(r"^[ \t]*(```|~~~)")
 PATH_SEP = " › "
 
 
+class InvalidChunkSettings(ValueError):
+    """chunk_size / chunk_overlap that cannot work together (a caller error: 422)."""
+
+
 @dataclass(frozen=True)
 class Chunk:
     """One piece of a document: its text and the headings it sits under."""
@@ -133,7 +137,7 @@ def chunk_markdown(text: str, chunk_size: int = 1500, chunk_overlap: int = 200) 
     if not cleaned:
         return []
     if chunk_overlap >= chunk_size:
-        raise ValueError("chunk_overlap must be strictly smaller than chunk_size")
+        raise InvalidChunkSettings("chunk_overlap must be strictly smaller than chunk_size")
 
     body_size = max(1, chunk_size - chunk_overlap)
     chunks: list[Chunk] = []

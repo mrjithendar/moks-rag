@@ -26,6 +26,7 @@ from rag_api.auth import (
     configure_logging,
     log_event,
 )
+from rag_api.chunking import InvalidChunkSettings
 from rag_api.config import COLLECTIONS, VIRTUAL_MODELS, CollectionName, Settings, get_settings
 from rag_api.docling import DoclingClient
 from rag_api.embeddings import EmbeddingClient
@@ -91,9 +92,15 @@ def _extract_answer_and_usage(
     return content, finish_reason, usage
 
 
+# Payload fields a filter may not name: the chunk text and the stored source document are large, and
+# the first filter on a key makes Qdrant index it.
+_UNFILTERABLE = ("text", *HIDDEN_KEYS)
+
+
 def _check_filters(filters: dict[str, Any] | None) -> None:
     for key in filters or {}:
-        if not _FILTER_KEY.match(key) or key in HIDDEN_KEYS:
+        root = key.split(".", 1)[0]
+        if not _FILTER_KEY.match(key) or root in _UNFILTERABLE:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=f"filter key {key!r} is not a filterable payload field",
@@ -492,9 +499,7 @@ def create_app(
                 )
                 try:
                     outcome = await indexer.ingest(doc)
-                except ValueError as exc:
-                    if isinstance(exc, NoIndexableText | EmbeddingInputTooLong):
-                        raise
+                except InvalidChunkSettings as exc:
                     raise HTTPException(
                         status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
                     ) from exc
@@ -542,9 +547,14 @@ def create_app(
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="doc_id is required"
             )
-        targets: list[str] = list(COLLECTIONS) if collection == "all" else [collection]
-        for target in targets:
-            principal.require_write(target)
+        if collection == "all":
+            # "all" = every collection this caller may write (README "API contract").
+            targets: list[str] = [c for c in COLLECTIONS if principal.can_write(c)]
+            if not targets:
+                principal.require_write(COLLECTIONS[0])  # 403: it may write none
+        else:
+            targets = [collection]
+            principal.require_write(collection)
         for target in targets:
             await request.app.state.qdrant.delete_document(target, doc_id)
         log_event(

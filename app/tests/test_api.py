@@ -429,12 +429,10 @@ def test_scoped_tokens_through_endpoints(client: TestClient) -> None:
         json={"collection": "sre_knowledge", "doc_id": "p1", "text": "post"},
     )
     assert denied.status_code == 403
-    assert (
-        client.delete(
-            "/documents/p1", params={"collection": "all"}, headers=svc("moks-cms")
-        ).status_code
-        == 403
+    other = client.delete(
+        "/documents/p1", params={"collection": "sre_knowledge"}, headers=svc("moks-cms")
     )
+    assert other.status_code == 403
     read_only = client.post(
         "/ingest",
         headers=svc("open-webui"),
@@ -446,3 +444,59 @@ def test_scoped_tokens_through_endpoints(client: TestClient) -> None:
     }
     assert client.get("/admin/collections", headers=svc("moks-cms")).status_code == 403
     assert client.get("/admin/collections", headers=svc("rag-admin")).status_code == 200
+
+
+# --- review follow-ups ---
+
+
+def test_delete_all_means_the_collections_the_caller_may_write(client: TestClient) -> None:
+    resp = client.delete("/documents/p1", params={"collection": "all"}, headers=svc("moks-cms"))
+    assert resp.status_code == 200 and resp.json()["collections"] == ["cms_content"]
+    assert (
+        client.delete(
+            "/documents/p1", params={"collection": "all"}, headers=svc("open-webui")
+        ).status_code
+        == 403
+    )
+
+
+def test_large_payload_fields_cannot_be_filtered(client: TestClient) -> None:
+    for key in ("text", "document", "document.text"):
+        resp = client.post(
+            "/query",
+            headers=auth(),
+            json={
+                "collection": "cms_content",
+                "query": "q",
+                "filters": {key: "x"},
+                "include_answer": False,
+            },
+        )
+        assert resp.status_code == 422, key
+
+
+def test_a_broken_embedding_answer_is_a_502_not_a_client_error(
+    client: TestClient, fakes: dict[str, Any]
+) -> None:
+    async def wrong_dim(texts: list[str]) -> Any:
+        raise UpstreamError("bge-m3", "returned a 768-dim embedding, expected 32")
+
+    fakes["embeddings"].embed_documents = wrong_dim
+    resp = client.post(
+        "/ingest",
+        headers=auth(),
+        json={"collection": "cms_content", "doc_id": "x", "text": "hello"},
+    )
+    assert resp.status_code == 502 and resp.json()["dependency"] == "bge-m3"
+    bad = client.post(
+        "/ingest",
+        headers=auth(),
+        json={
+            "collection": "cms_content",
+            "doc_id": "x",
+            "text": "hello",
+            "chunk_size": 100,
+            "chunk_overlap": 100,
+        },
+    )
+    assert bad.status_code == 422

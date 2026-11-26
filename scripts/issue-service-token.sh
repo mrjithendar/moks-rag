@@ -5,7 +5,7 @@
 #
 # <service> is a key of deploy/k8s/rag-api.yaml's ConfigMap rag-api-access. The script:
 #   1. generates a random token,
-#   2. adds it to RAG_SERVICE_TOKENS (JSON) in Secret rag/rag-secrets (open-webui: OPEN_WEBUI_RAG_TOKEN instead),
+#   2. adds it to RAG_SERVICE_TOKENS (JSON) in Secret rag/rag-secrets (open-webui: also OPEN_WEBUI_RAG_TOKEN),
 #   3. writes it into the caller's own Secret, keeping that Secret's other keys,
 #   4. restarts rag-api (and Open WebUI for open-webui), then tells you which caller to restart.
 # The token is never printed. The shared RAG_BEARER_TOKEN keeps working until RAG_SHARED_TOKEN_ENABLED=false.
@@ -48,20 +48,26 @@ put_secret_key() { # namespace secret key value
   fi
 }
 
-if [[ "$service" != "open-webui" ]]; then
-  current_json="$(kubectl -n rag get secret rag-secrets -o jsonpath='{.data.RAG_SERVICE_TOKENS}' | base64 -d 2>/dev/null || true)"
-  merged="$(CURRENT="$current_json" SERVICE="$service" TOKEN="$token" python3 -c '
-import json, os
+# Every service's token is registered in RAG_SERVICE_TOKENS (rag-api reads only that and RAG_BEARER_TOKEN), Open
+# WebUI's too. rag-secrets is read once and must be read: a failed read stops here, it never looks like "no tokens yet"
+# (which would overwrite every other service's token).
+secret_json="$(kubectl -n rag get secret rag-secrets -o json)"
+merged="$(SECRET_JSON="$secret_json" SERVICE="$service" TOKEN="$token" python3 -c '
+import base64, json, os
+data = json.loads(os.environ["SECRET_JSON"]).get("data") or {}
+raw = data.get("RAG_SERVICE_TOKENS")
 try:
-    tokens = json.loads(os.environ["CURRENT"] or "{}")
-except json.JSONDecodeError:
+    tokens = json.loads(base64.b64decode(raw)) if raw else {}
+except ValueError:
     raise SystemExit("rag-secrets RAG_SERVICE_TOKENS is not valid JSON; fix it by hand first")
+if not isinstance(tokens, dict):
+    raise SystemExit("rag-secrets RAG_SERVICE_TOKENS is not a JSON object; fix it by hand first")
 tokens[os.environ["SERVICE"]] = os.environ["TOKEN"]
 print(json.dumps(tokens, sort_keys=True))
 ')"
-  put_secret_key rag rag-secrets RAG_SERVICE_TOKENS "$merged"
-  unset merged current_json
-fi
+unset secret_json
+put_secret_key rag rag-secrets RAG_SERVICE_TOKENS "$merged"
+unset merged
 put_secret_key "$ns" "$secret" "$key" "$token"
 unset token
 # seo-agent and MOKS read RAG_API_URL from the same Secret and treat rag as off without it.

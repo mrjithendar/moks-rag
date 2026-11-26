@@ -245,3 +245,90 @@ async def test_ingest_concurrency_limit_queues_ingests(store: QdrantStore) -> No
 
     await asyncio.gather(*(one(i) for i in range(4)))
     assert peak == 1
+
+
+# --- review follow-ups ---
+
+
+async def test_retry_after_a_failed_cleanup_removes_the_old_version(
+    store: QdrantStore, qdrant: AsyncQdrantClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    indexer = Indexer(make_settings(), store, FakeEmbeddingClient())
+    await indexer.ingest(doc("half", "first version text"))
+    real_prune = store.prune_older
+    calls = {"n": 0}
+
+    async def flaky_prune(*args: Any, **kwargs: Any) -> None:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("qdrant timed out")
+        await real_prune(*args, **kwargs)
+
+    monkeypatch.setattr(store, "prune_older", flaky_prune)
+    with pytest.raises(RuntimeError):
+        await indexer.ingest(doc("half", "second version text"))
+    assert len(await doc_points(qdrant, "sre_knowledge__v2", "half")) == 2  # both versions, for now
+
+    retry = await indexer.ingest(doc("half", "second version text"))
+    assert retry.unchanged
+    points = await doc_points(qdrant, "sre_knowledge__v2", "half")
+    assert [p.payload["text"] for p in points] == ["second version text"]
+
+
+class SlowOld(FakeEmbeddingClient):
+    """Embedding of the stale copy waits until the test lets it go."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.gate: asyncio.Event | None = None
+
+    async def embed_documents(self, texts: list[str]) -> Any:
+        if self.gate is not None and any("OLD" in t for t in texts):
+            await self.gate.wait()
+        return await super().embed_documents(texts)
+
+
+async def test_a_live_write_during_a_rebuild_wins_over_the_stale_copy(
+    qdrant: AsyncQdrantClient,
+) -> None:
+    emb = SlowOld()
+    v2 = QdrantStore(make_settings(index_version="v2"), client=qdrant)
+    await v2.ensure_collections()
+    await Indexer(make_settings(index_version="v2"), v2, emb).ingest(
+        doc("blog:a", "OLD content version one", collection="cms_content")
+    )
+    s3 = make_settings(index_version="v3")
+    v3 = QdrantStore(s3, client=qdrant)
+    await v3.ensure_collections()
+    indexer = Indexer(s3, v3, emb)
+    emb.gate = asyncio.Event()
+    indexer.start_rebuild("cms_content", promote=True)
+    await asyncio.sleep(0.05)  # the rebuild has read OLD and is embedding it
+    await indexer.ingest(doc("blog:a", "NEW content version two", collection="cms_content"))
+    emb.gate.set()
+    await indexer._rebuild_tasks["cms_content"]
+    for physical in ("cms_content__v2", "cms_content__v3"):
+        texts = [p.payload["text"] for p in await doc_points(qdrant, physical, "blog:a")]
+        assert texts == ["NEW content version two"], physical
+
+
+async def test_dual_writes_share_one_version_timestamp(qdrant: AsyncQdrantClient) -> None:
+    v2 = QdrantStore(make_settings(index_version="v2"), client=qdrant)
+    await v2.ensure_collections()
+    s3 = make_settings(index_version="v3")
+    v3 = QdrantStore(s3, client=qdrant)
+    await v3.ensure_collections()
+    await Indexer(s3, v3, FakeEmbeddingClient()).ingest(doc("d", "written to both"))
+    a = await doc_points(qdrant, "sre_knowledge__v2", "d")
+    b = await doc_points(qdrant, "sre_knowledge__v3", "d")
+    assert a[0].payload["ingest_ts"] == b[0].payload["ingest_ts"]
+
+
+async def test_dropping_a_physical_collection_first_learns_what_is_served(
+    qdrant: AsyncQdrantClient,
+) -> None:
+    first = QdrantStore(make_settings(), client=qdrant)
+    await first.ensure_collections()
+    cold = QdrantStore(make_settings(), client=qdrant)  # a process whose bootstrap was deferred
+    with pytest.raises(ValueError):
+        await cold.drop_physical("cms_content__v2")
