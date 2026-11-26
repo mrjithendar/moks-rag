@@ -15,9 +15,12 @@ class IngestJSONRequest(BaseModel):
 
     collection: CollectionName
     text: str = Field(min_length=1, description="Raw or markdown text to chunk and index")
-    doc_id: str | None = Field(
-        default=None,
-        description="Stable document identifier used for idempotent updates and DELETE sync",
+    doc_id: str = Field(
+        min_length=1,
+        description=(
+            "Stable document identifier: sending the same doc_id again replaces the document, "
+            "and DELETE /documents uses it"
+        ),
     )
     title: str | None = None
     source: str | None = None
@@ -34,6 +37,11 @@ class IngestResponse(BaseModel):
     chunks_ingested: int
     parsed_via_docling: bool
     service: str
+    unchanged: bool = Field(
+        default=False,
+        description="True when the stored version was identical: nothing was embedded or written",
+    )
+    index_version: str = ""
 
 
 class DeleteDocumentResponse(BaseModel):
@@ -51,6 +59,17 @@ class QueryRequest(BaseModel):
     collection: CollectionName
     query: str = Field(min_length=1)
     top_k: int = Field(default=6, ge=1, le=50)
+    min_dense_score: float | None = Field(
+        default=None,
+        ge=-1.0,
+        le=1.0,
+        description=(
+            "Drop chunks whose dense cosine similarity to the query is below this (empty = no "
+            "floor). "
+            "`score` is a rank-fusion score and cannot be compared with a fixed number; "
+            "`dense_score` can."
+        ),
+    )
     model: str | None = Field(
         default=None,
         description="LiteLLM model override (e.g. claude-sonnet-5-5 or claude-haiku-5-5)",
@@ -73,7 +92,15 @@ class RetrievedChunk(BaseModel):
 
     id: str
     doc_id: str
-    score: float
+    score: float = Field(
+        description="Reciprocal Rank Fusion score: orders one answer's chunks only"
+    )
+    dense_score: float | None = Field(
+        default=None, description="Cosine similarity of the chunk's dense vector to the query"
+    )
+    rerank_score: float | None = Field(
+        default=None, description="Cross-encoder relevance logit, when the reranker ran"
+    )
     text: str
     metadata: dict[str, Any] = Field(default_factory=dict)
 
@@ -87,6 +114,9 @@ class QueryResponse(BaseModel):
     answer: str | None
     sources: list[RetrievedChunk]
     service: str
+    reranker: str = Field(
+        default="off", description="applied, off, unavailable, busy, timeout or error"
+    )
 
 
 # --- OpenAI-compatible schemas for Open WebUI ---
@@ -107,11 +137,13 @@ class ModelListResponse(BaseModel):
 
 
 class ChatMessage(BaseModel):
-    role: Literal["system", "user", "assistant", "tool"]
-    content: str | list[dict[str, Any]]
+    role: Literal["system", "developer", "user", "assistant", "tool"]
+    content: str | list[dict[str, Any]] | None = None
 
     def text_content(self) -> str:
         """Flatten string or OpenAI multi-part content into plain text."""
+        if self.content is None:
+            return ""
         if isinstance(self.content, str):
             return self.content
         parts: list[str] = []
@@ -129,6 +161,7 @@ class ChatCompletionRequest(BaseModel):
     stream: bool = False
     top_k: int | None = Field(default=None, ge=1, le=50)
     filters: dict[str, str | int | float | bool] | None = None
+    min_dense_score: float | None = Field(default=None, ge=-1.0, le=1.0)
 
 
 class ChatCompletionMessageOut(BaseModel):
@@ -155,3 +188,25 @@ class ChatCompletionResponse(BaseModel):
     model: str
     choices: list[ChatCompletionChoice]
     usage: ChatCompletionUsage = Field(default_factory=ChatCompletionUsage)
+
+
+# --- Admin ---
+
+
+class CollectionStatus(BaseModel):
+    collection: str
+    mode: Literal["alias", "legacy"]
+    serving: str = Field(description="Physical collection searches read")
+    target: str = Field(description="Physical collection of this rag-api's INDEX_VERSION")
+    points_serving: int
+    points_target: int
+    documents_without_source: int = Field(
+        description="0.1.0 documents in the served collection that a rebuild cannot copy"
+    )
+    rebuild: dict[str, Any] | None = None
+
+
+class CollectionsStatusResponse(BaseModel):
+    index_version: str
+    collections: list[CollectionStatus]
+    physical_collections: list[str]

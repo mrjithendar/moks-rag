@@ -9,11 +9,11 @@ All components run in the `rag` namespace and communicate over internal Kubernet
 | Component | Image / Chart | Internal Endpoint | Purpose |
 | --- | --- | --- | --- |
 | `bge-m3` | `ollama/ollama:0.40.16` (`bge-m3:567m`) | `http://bge-m3.rag.svc.cluster.local:8001` (and `:11434`) | 1024-dim dense embeddings on ARM64 CPU (migrated from `embeddings` namespace) |
-| `qdrant` | Helm `qdrant/qdrant` (ArgoCD multi-source) | `http://qdrant.rag.svc.cluster.local:6333` | Vector store (`15Gi` PVC, 3 isolated dense+sparse RRF collections) |
-| `docling-serve` | `ghcr.io/docling-project/docling-serve-cpu:latest` | `http://docling-serve.rag.svc.cluster.local:5001` | Document parsing (PDF/DOCX/HTML -> Markdown, 2–4Gi RAM) |
-| `litellm` | `ghcr.io/berriai/litellm:main-latest` | `http://litellm.rag.svc.cluster.local:4000/v1` | OpenAI-compatible proxy routing `claude-sonnet-5-5` & `claude-haiku-5-5` |
-| `rag-api` | `ghcr.io/mrjithendar/moks-rag-api:<sha>` | `http://rag-api.rag.svc.cluster.local:8000` | Custom FastAPI orchestrator (`root_path="/rag"`) |
-| `open-webui` | `ghcr.io/open-webui/open-webui:main` | `http://open-webui.rag.svc.cluster.local:80` | Chat UI (`2Gi` PVC) pointing at `rag-api` `/v1` |
+| `qdrant` | Helm `qdrant/qdrant` chart `1.20.2` (ArgoCD multi-source) | `http://qdrant.rag.svc.cluster.local:6333` | Vector store (`15Gi` PVC; 3 aliases over versioned dense+sparse collections, see [Index versions](#index-versions)) |
+| `docling-serve` | `ghcr.io/docling-project/docling-serve-cpu` 1.39.0, pinned by digest | `http://docling-serve.rag.svc.cluster.local:5001` | Document parsing (PDF/DOCX/HTML -> Markdown via its async API, 2–4Gi RAM) |
+| `litellm` | `ghcr.io/berriai/litellm`, pinned by digest | `http://litellm.rag.svc.cluster.local:4000/v1` | OpenAI-compatible proxy routing `claude-sonnet-5-5` & `claude-haiku-5-5` |
+| `rag-api` | `ghcr.io/mrjithendar/moks-rag-api:<sha>` | `http://rag-api.rag.svc.cluster.local:8000` (metrics `:9464`) | Custom FastAPI orchestrator (`root_path="/rag"`) |
+| `open-webui` | `ghcr.io/open-webui/open-webui`, pinned by digest | `http://open-webui.rag.svc.cluster.local:80` | Chat UI (`2Gi` PVC) pointing at `rag-api` `/v1` |
 
 ### Collections & Virtual Models
 
@@ -31,6 +31,19 @@ All components run in the `rag` namespace and communicate over internal Kubernet
 moks-rag/
 ├── app/                                 # FastAPI rag-api service, Dockerfile, pytest suite
 │   ├── src/rag_api/
+│   │   ├── main.py        # endpoints, error mapping
+│   │   ├── auth.py        # per-service tokens, access rules, access log
+│   │   ├── store.py       # Qdrant: aliases, index versions, document replacement, hybrid search
+│   │   ├── indexer.py     # chunk -> embed -> write, unchanged skip, rebuilds
+│   │   ├── chunking.py    # Markdown-section chunks with heading paths
+│   │   ├── sparse.py      # Unicode + stemmed BM25-style sparse terms
+│   │   ├── embeddings.py  # bge-m3 (Ollama /api/embed)
+│   │   ├── docling.py     # docling-serve async conversion
+│   │   ├── llm.py         # LiteLLM, streams checked before answering
+│   │   ├── prompts.py     # fixed system prompt, documents as data in the user turn
+│   │   ├── rerank.py      # optional int8 cross-encoder (off)
+│   │   ├── metrics.py     # Prometheus
+│   │   └── eval.py        # python -m rag_api.eval
 │   ├── tests/
 │   ├── Dockerfile
 │   ├── pyproject.toml
@@ -53,8 +66,10 @@ moks-rag/
 │       ├── rag-stack-app.yaml
 │       ├── qdrant-app.yaml
 │       └── qdrant-values.yaml
+├── scripts/
+│   └── issue-service-token.sh           # give one caller its own token (README "Access")
 └── .github/workflows/
-    ├── build-and-deploy.yaml            # Lint/test -> multi-arch GHCR push -> Kustomize tag bump
+    ├── build-and-deploy.yaml            # Lint/test (+ image build on PRs) -> multi-arch GHCR push -> Kustomize tag bump
     └── deploy-argocd-apps.yaml          # Validate & apply ArgoCD AppProject/Applications to k3s
 ```
 
@@ -92,6 +107,9 @@ kubectl -n rag create secret generic rag-secrets \
   --dry-run=client -o yaml | kubectl apply -f -
 ```
 
+Two optional keys are added later by `scripts/issue-service-token.sh` (see [Access](#access-per-service-tokens)):
+`RAG_SERVICE_TOKENS` (JSON, one token per calling service) and `OPEN_WEBUI_RAG_TOKEN`.
+
 **Option B — GitOps with SealedSecrets / External Secrets Operator:**
 
 - Use `deploy/k8s/rag-secrets.sealed-secret.yaml.template` with `kubeseal`, or `deploy/k8s/rag-secrets.external-secret.yaml.template` with Vault ESO, then add the generated file to `deploy/k8s/kustomization.yaml`.
@@ -107,7 +125,7 @@ root:
     - {name: chat, prefix: /chat, to: rag/open-webui} # <-- add
 ```
 
-> **Open WebUI subpath note:** Upstream `ghcr.io/open-webui/open-webui:main` builds its SvelteKit frontend with `base: ""` (root-absolute `/_app/...`, `/static/...`, `/api/...`, `/ws/socket.io/...`). If assets 404 under `/chat/`, either build Open WebUI with SvelteKit `paths.base = "/chat"` or configure a `302` redirect in `istio-edge` from `/chat` to `chat.jithendar.com` (the same pattern used for Harbor's `/harbor` -> `registry.jithendar.com`).
+> **Open WebUI under `/chat`:** its prebuilt SvelteKit frontend assumes `/`. `deploy/k8s/open-webui.yaml`'s `patch_subpath.py` rewrites it at start-up and then verifies the result: if a new Open WebUI build no longer matches, the container refuses to start (visible in Argo CD) instead of serving a `/chat` that loads nothing. The image is pinned by digest for that reason.
 
 ### 3. Apply ArgoCD `AppProject` and `Application`s (Manual or via GitHub Actions)
 
@@ -235,6 +253,100 @@ Open `https://jithendar.com/chat/` in your browser, sign in (the first registere
 
 ---
 
+## API contract (0.2.0)
+
+| Endpoint | Scope | Notes |
+| --- | --- | --- |
+| `POST /ingest` | write on `collection` | JSON or multipart (`file` via docling-serve). **`doc_id` is required**: sending the same `doc_id` again replaces the document. The answer has `unchanged: true` when the stored version was identical (nothing embedded or written). A chunk too long for bge-m3's context is refused with 422 instead of being embedded from its start only. |
+| `DELETE /documents/{doc_id}?collection=…` | write | **`collection` is required** (`all` = every collection the caller may write). `doc_id` may contain `/`. Also `DELETE /documents?doc_id=…&collection=…`. |
+| `POST /query` | read | Each source has `score` (rank fusion: orders one answer only), **`dense_score`** (cosine similarity, comparable across queries) and `rerank_score` when the reranker ran. `min_dense_score` drops chunks below a cosine floor. `model` must be `DEFAULT_LLM_MODEL` or `FAST_LLM_MODEL`. |
+| `GET /v1/models`, `POST /v1/chat/completions` | read on the model's collection | OpenAI-compatible, for Open WebUI. Follow-ups are rewritten into a standalone search query with `FAST_LLM_MODEL` (`CONDENSE_FOLLOWUPS`). Open WebUI's background tasks (title, tags, follow-ups: messages starting `### Task:`) skip retrieval and use `FAST_LLM_MODEL`. |
+| `GET /admin/collections`, `POST /admin/collections/{name}/rebuild`, `…/promote`, `DELETE /admin/physical/{name}` | admin | [Index versions](#index-versions). |
+
+Prompts: the system prompt is fixed per model; retrieved chunks go in the user turn inside `<documents><document doc_id=… title=… section=…>` and the system prompt says they are data, not instructions (retrieved text can come from third-party pages, e.g. `seo_intel`).
+
+Errors name the dependency that failed: `503` unreachable, `504` too slow, `429` rate-limited (with `Retry-After`), `502` anything else, body `{"detail", "dependency", "kind", "request_id"}`. A stream that fails after it started ends with an SSE `{"error": …}` event and `[DONE]`.
+
+## Access: per-service tokens
+
+Every caller can get its own token, limited by the access policy in `deploy/k8s/rag-api.yaml` (ConfigMap `rag-api-access`): `moks-cms` writes `cms_content`; `moks-seo-agent` writes `seo_intel` and reads `cms_content`; `moks-sre-agent` writes `sre_knowledge`; `open-webui` reads everything; `rag-admin` may use `/admin/*`. With its own token, a caller's logs and metrics carry the token's service, whatever `X-Service-Name` says.
+
+The 0.1.0 shared `RAG_BEARER_TOKEN` keeps full access while `RAG_SHARED_TOKEN_ENABLED` is `"true"`, so nothing breaks during the move. To move one caller (no code change in the caller: each one already reads its token from its own Secret):
+
+```bash
+scripts/issue-service-token.sh moks-cms         # Secret jithendar/jithendar-com-rag (key token)
+scripts/issue-service-token.sh moks-seo-agent   # Secret jithendar/seo-agent-rag (RAG_BEARER_TOKEN)
+scripts/issue-service-token.sh moks-sre-agent   # Secret moks-sre/moks-rag-client (RAG_BEARER_TOKEN)
+scripts/issue-service-token.sh open-webui       # rag-secrets OPEN_WEBUI_RAG_TOKEN
+```
+
+Then restart the caller it names and check rag-api's log lines show `"auth": "service-token"` for it. When no request uses `"auth": "shared-token"` any more, set `RAG_SHARED_TOKEN_ENABLED` to `"false"` in `deploy/k8s/rag-api.yaml`. Open WebUI keeps its connection key in its database once it was saved in Admin → Settings → Connections; then paste the new token there too.
+
+## Index versions
+
+Each logical collection is a Qdrant **alias** for a physical collection `<name>__<INDEX_VERSION>` (now `v2`). The index version covers everything that decides what a stored point looks like: chunking, the sparse encoder, the embedded text and the payload. On start-up rag-api creates the physical collections of its version and:
+
+- replaces an **empty** 0.1.0 collection (a real collection named `cms_content` etc.) with the alias, at once;
+- keeps a **non-empty** 0.1.0 collection in service (`mode: legacy`, writes also go to `__v2`) until `POST /admin/collections/{name}/promote?drop_legacy=true`, because 0.1.0 points do not carry their source document and only the callers can re-send them.
+
+Every chunk 0 stores its source document, so a later version bump needs no caller: set `INDEX_VERSION`, deploy (writes now go to the old and the new version, reads stay on the old one), then
+
+```bash
+curl -X POST -H "Authorization: Bearer $ADMIN" "http://rag-api.rag.svc.cluster.local:8000/admin/collections/cms_content/rebuild?promote=true"
+curl -H "Authorization: Bearer $ADMIN" http://rag-api.rag.svc.cluster.local:8000/admin/collections   # progress
+curl -X DELETE -H "Authorization: Bearer $ADMIN" http://rag-api.rag.svc.cluster.local:8000/admin/physical/cms_content__v2   # later, the old version
+```
+
+Re-ingesting never deletes first: new chunks are written under new point ids, then older versions of the `doc_id` are removed, so a search never sees the document missing and a failed write keeps the previous version.
+
+## Limits and tuning
+
+All of these are empty in `deploy/k8s/rag-api.yaml`, which means **no limit**; set numbers there when you want one.
+
+| Variable | What it bounds |
+| --- | --- |
+| `INGEST_MAX_CONCURRENCY` | ingests (parse + embed + write) running at once; queries never wait for a slot, so a bulk reindex cannot queue them behind it |
+| `MAX_UPLOAD_BYTES` | largest `/ingest` body (413 above it) |
+| `DOCLING_TIMEOUT_SECONDS` | one file conversion in docling-serve (rag-api polls its async API, so no single HTTP request waits for the whole conversion) |
+| `MAX_HISTORY_MESSAGES` | earlier chat messages forwarded to the model |
+| `DEFAULT_MIN_DENSE_SCORE` | cosine floor for chat retrieval (requests can send `min_dense_score`) |
+| `RERANKER_ENABLED`, `RERANKER_CANDIDATES`, `RERANKER_TIMEOUT_MS`, `RERANKER_MAX_CONCURRENT`, `RERANKER_THREADS` | the optional cross-encoder (`cross-encoder/ms-marco-MiniLM-L6-v2` int8, baked into the image, same model and pins as moks-seo-agent). Off; measure `rag_api_stage_duration_seconds{stage="rerank"}` on mk4 and the eval below before switching it on. |
+
+## Observability
+
+rag-api serves Prometheus metrics on `:9464` (`METRICS_PORT`), never routed by the edge; Prometheus job `rag-api` finds the pods through the headless Service `rag-api-metrics`. Labels use the authenticated service (`shared-token` for the shared token), never a claimed name.
+
+| Metric | Meaning |
+| --- | --- |
+| `rag_api_http_requests_total`, `rag_api_http_request_duration_seconds` | by route template; streams are timed to their last byte |
+| `rag_api_stage_duration_seconds{stage}` | `embed_query`, `embed_documents`, `search`, `rerank`, `docling`, `llm`, `condense` |
+| `rag_api_retrievals_total`, `rag_api_retrieval_zero_hits_total` | searches and empty results, by service and collection |
+| `rag_api_llm_tokens_total{service,model,purpose,kind}` | tokens LiteLLM reported (`purpose`: answer, chat, condense, task), streamed answers included |
+| `rag_api_ingests_total{outcome}`, `rag_api_ingest_chunks_total`, `rag_api_ingests_in_progress`, `rag_api_ingests_waiting` | the write path |
+| `rag_api_upstream_errors_total{dependency,kind}` | failed calls to bge-m3, qdrant, docling-serve, litellm |
+| `rag_api_collection_info{collection,physical,mode}` | which physical collection each alias serves |
+
+## Retrieval evaluation
+
+`python -m rag_api.eval` asks a running rag-api (`POST /query`, `include_answer: false`, so no LLM cost) a question set and reports Recall@k, MRR, per type/tag, misses, and what no-answer questions got back (with `dense_score`, to calibrate `min_dense_score`). moks-seo-agent's 95-question blog set works as is for `cms_content`:
+
+```bash
+kubectl -n rag port-forward svc/rag-api 8000:8000 &
+RAG_EVAL_TOKEN=... python -m rag_api.eval --collection cms_content \
+  --questions ../moks-seo-agent/app/data/rag_eval.yaml --doc-id-template 'blog:{slug}' --k 1 3 5 --json report.json
+```
+
+Run it before and after a retrieval change (chunking, reranker, floor) and compare.
+
+## Upgrading to 0.2.0
+
+1. Deploy (merge). On start-up the empty 0.1.0 collections become aliases for `__v2` (on 2026-11-26 all three had 0 points). If one has points by then, it stays in service as `legacy`: re-send its documents from the caller (moks-cms Admin → Integrations → Hybrid RAG → Reindex all posts; seo-agent `seo_intel_sync_flow`; `moks shared-kb sync --all`), then `promote?drop_legacy=true`.
+2. Callers need no change: they already send `doc_id` and `collection`, and keep the shared token until step 3.
+3. Issue per-service tokens ([Access](#access-per-service-tokens)), then switch the shared token off.
+4. Merge the Prometheus job `rag-api` (k8s-deployments) so the metrics are scraped.
+
+---
+
 ## Local Development & CI/CD
 
 ```bash
@@ -245,7 +357,9 @@ ruff check src tests
 pytest -v
 ```
 
+The tests run a real `QdrantStore` on qdrant-client's in-memory mode (no server). In-memory Qdrant ignores payload indexes, so index behaviour is only exercised on the cluster.
+
 Pushing changes under `app/**` to `main` triggers `.github/workflows/build-and-deploy.yaml`:
-1. Runs `ruff` and `pytest` on `app/`.
+1. Runs `ruff` and `pytest` on `app/`; on pull requests also builds the image (amd64, not pushed).
 2. Builds and pushes a multi-arch (`linux/arm64,linux/amd64`) image to `ghcr.io/<owner>/moks-rag-api:<sha>`.
 3. Updates `newTag` in `deploy/k8s/kustomization.yaml` and commits back to `main` (`[skip ci]`), triggering ArgoCD auto-sync.

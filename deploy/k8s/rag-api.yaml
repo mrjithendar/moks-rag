@@ -8,6 +8,32 @@ metadata:
     app.kubernetes.io/part-of: rag
 automountServiceAccountToken: false
 ---
+# What each service may do with its own token (RAG_SERVICE_TOKENS in Secret rag-secrets; README "Access").
+# Collections: sre_knowledge, cms_content, seo_intel, or "*". Write implies read. A service with a token but no
+# entry here may do nothing. The rules mirror what each caller's own client already limits itself to:
+#   moks-cms        writes cms_content (src/lib/rag/sync.ts, doc_id "<post collection>:<slug>")
+#   moks-seo-agent  writes seo_intel, reads cms_content (app/moks_rag.py refuses anything else)
+#   moks-sre-agent  writes sre_knowledge (backend/moks/rag/shared.py)
+#   open-webui      reads every collection (the three virtual models)
+#   rag-admin       index versions (/admin/*); issue its token only when needed
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rag-api-access
+  namespace: rag
+  labels:
+    app: rag-api
+    app.kubernetes.io/part-of: rag
+data:
+  policy.json: |
+    {
+      "moks-cms": {"read": ["cms_content"], "write": ["cms_content"]},
+      "moks-seo-agent": {"read": ["seo_intel", "cms_content"], "write": ["seo_intel"]},
+      "moks-sre-agent": {"read": ["sre_knowledge"], "write": ["sre_knowledge"]},
+      "open-webui": {"read": ["*"]},
+      "rag-admin": {"read": ["*"], "write": ["*"], "admin": true}
+    }
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -51,10 +77,10 @@ spec:
               value: "http://bge-m3.rag.svc.cluster.local:8001"
             - name: BGE_M3_MODEL
               value: "bge-m3:567m"
+            # Ollama's native /api/embed: documents are embedded with truncate=false, so a chunk longer than
+            # OLLAMA_CONTEXT_LENGTH (bge-m3.yaml) is refused (422) instead of being embedded from its start only.
             - name: BGE_M3_API_STYLE
-              value: "openai"
-            - name: SPARSE_MODE
-              value: "bm25"
+              value: "ollama"
             - name: DOCLING_URL
               value: "http://docling-serve.rag.svc.cluster.local:5001"
             - name: LITELLM_URL
@@ -63,11 +89,50 @@ spec:
               value: "claude-sonnet-5-5"
             - name: FAST_LLM_MODEL
               value: "claude-haiku-5-5"
+            - name: METRICS_PORT
+              value: "9464"
+            # --- Access (README "Access") ---
+            # The 0.1.0 shared token: full access while this is "true". Set "false" once every caller has its own.
+            - name: RAG_SHARED_TOKEN_ENABLED
+              value: "true"
             - name: RAG_BEARER_TOKEN
               valueFrom:
                 secretKeyRef:
                   name: rag-secrets
                   key: RAG_BEARER_TOKEN
+            - name: RAG_SERVICE_TOKENS
+              valueFrom:
+                secretKeyRef:
+                  name: rag-secrets
+                  key: RAG_SERVICE_TOKENS
+                  optional: true
+            - name: RAG_ACCESS_POLICY
+              valueFrom:
+                configMapKeyRef:
+                  name: rag-api-access
+                  key: policy.json
+            # --- Limits: empty = no limit. The owner sets the numbers. ---
+            - name: INGEST_MAX_CONCURRENCY # ingests embedding at once; queries never wait for a slot
+              value: ""
+            - name: MAX_UPLOAD_BYTES # largest /ingest body
+              value: ""
+            - name: DOCLING_TIMEOUT_SECONDS # one file conversion in docling-serve
+              value: ""
+            - name: MAX_HISTORY_MESSAGES # earlier chat messages forwarded to the model
+              value: ""
+            - name: DEFAULT_MIN_DENSE_SCORE # cosine floor for chat retrieval (requests can send their own)
+              value: ""
+            # --- Reranker (baked into the image, off). Measure rag_api_stage_duration_seconds{stage="rerank"}. ---
+            - name: RERANKER_ENABLED
+              value: "false"
+            - name: RERANKER_CANDIDATES # fused results it reads; empty = top_k (reorder only)
+              value: ""
+            - name: RERANKER_TIMEOUT_MS
+              value: ""
+            - name: RERANKER_MAX_CONCURRENT
+              value: ""
+            - name: RERANKER_THREADS
+              value: ""
             - name: QDRANT_API_KEY
               valueFrom:
                 secretKeyRef:
@@ -81,6 +146,8 @@ spec:
           ports:
             - name: http
               containerPort: 8000
+            - name: metrics
+              containerPort: 9464
           startupProbe:
             httpGet:
               path: /health
@@ -138,4 +205,25 @@ spec:
     - name: http
       port: 8000
       targetPort: http
+      appProtocol: http
+---
+# Prometheus finds rag-api pods through this headless Service (DNS A records, no Kubernetes API access needed;
+# job "rag-api" in k8s-deployments observability/prometheus/values.yaml). Declaring :9464 here is what makes
+# Prometheus's sidecar send mTLS to it (namespace rag is STRICT). Not routed by the edge: only /rag -> :8000 is.
+apiVersion: v1
+kind: Service
+metadata:
+  name: rag-api-metrics
+  namespace: rag
+  labels:
+    app: rag-api
+    app.kubernetes.io/part-of: rag
+spec:
+  clusterIP: None
+  selector:
+    app: rag-api
+  ports:
+    - name: http-metrics
+      port: 9464
+      targetPort: metrics
       appProtocol: http

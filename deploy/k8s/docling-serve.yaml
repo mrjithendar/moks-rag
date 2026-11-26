@@ -32,7 +32,9 @@ spec:
       enableServiceLinks: false
       containers:
         - name: docling-serve
-          image: ghcr.io/docling-project/docling-serve-cpu:latest
+          # Pinned to the digest mk4 ran on 2026-11-26 (docling-serve 1.39.0, multi-arch index). rag-api uses its async
+          # API (/v1/convert/file/async, /v1/status/poll, /v1/result): check those still exist before upgrading.
+          image: ghcr.io/docling-project/docling-serve-cpu:latest@sha256:38d98a8016f6e6220bda0e11d579ffcfa27055d82bbebc22fc346eaf737105dd
           imagePullPolicy: IfNotPresent
           env:
             - name: DOCLING_SERVE_ENABLE_UI
@@ -41,8 +43,6 @@ spec:
               value: "0.0.0.0"
             - name: DOCLING_SERVE_PORT
               value: "5001"
-            - name: DOCLING_SERVE_MAX_SYNC_WAIT
-              value: "180"
             - name: OMP_NUM_THREADS
               value: "2"
           ports:

@@ -5,11 +5,8 @@
 #     - {name: rag, prefix: /rag, to: rag/rag-api}
 #     - {name: chat, prefix: /chat, to: rag/open-webui}
 #
-# Note on Open WebUI subpath (`/chat`):
-#   The upstream `ghcr.io/open-webui/open-webui:main` SvelteKit bundle compiles with `base: ""`
-#   (root-absolute `/_app/...`, `/static/...`, `/api/...`, `/ws/socket.io/...`). If assets 404
-#   under `/chat`, either build Open WebUI with SvelteKit `paths.base = "/chat"` or redirect
-#   `/chat` -> `https://chat.jithendar.com` in `istio-edge` (matching Harbor's `/harbor` redirect).
+# Open WebUI under `/chat`: its prebuilt SvelteKit bundle assumes `/`; open-webui.yaml's patch_subpath.py
+# rewrites it at start-up (and refuses to start if a new build no longer matches).
 #
 # Strictly internal services (`bge-m3`, `qdrant`, `docling-serve`, `litellm`) have NO VirtualService
 # and are exposed via ClusterIP only.
@@ -134,6 +131,14 @@ spec:
       to:
         - operation:
             ports: ["8000"]
+    # Prometheus (job rag-api) scrapes /metrics on 9464 through the headless Service rag-api-metrics.
+    - from:
+        - source:
+            namespaces: ["monitoring"]
+      to:
+        - operation:
+            ports: ["9464"]
+            methods: ["GET"]
 ---
 # Allow Istio ingress gateway to reach open-webui.
 apiVersion: security.istio.io/v1
