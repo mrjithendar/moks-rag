@@ -17,8 +17,8 @@ set -euo pipefail
 service="${1:-}"
 case "$service" in
   moks-cms)       ns=jithendar; secret=jithendar-com-rag; key=token;            restart="deploy/jithendar-com -n jithendar" ;;
-  moks-seo-agent) ns=jithendar; secret=seo-agent-rag;     key=RAG_BEARER_TOKEN; restart="the seo-agent Deployment in namespace jithendar" ;;
-  moks-sre-agent) ns=moks-sre;  secret=moks-rag-client;   key=RAG_BEARER_TOKEN; restart="MOKS api, worker and crewai in namespace moks-sre" ;;
+  moks-seo-agent) ns=jithendar; secret=seo-agent-rag;     key=RAG_BEARER_TOKEN; restart="deploy/seo-agent -n jithendar (Recreate: check that no flow is running first)" ;;
+  moks-sre-agent) ns=moks-sre;  secret=moks-rag-client;   key=RAG_BEARER_TOKEN; restart="the MOKS api, worker and crewai Deployments in namespace moks-sre" ;;
   open-webui)     ns=rag;       secret=rag-secrets;       key=OPEN_WEBUI_RAG_TOKEN; restart="" ;;
   rag-admin)      ns=rag;       secret=rag-admin-token;   key=token;            restart="" ;;
   *)
@@ -64,6 +64,14 @@ print(json.dumps(tokens, sort_keys=True))
 fi
 put_secret_key "$ns" "$secret" "$key" "$token"
 unset token
+# seo-agent and MOKS read RAG_API_URL from the same Secret and treat rag as off without it.
+case "$service" in
+  moks-seo-agent|moks-sre-agent)
+    if [[ -z "$(kubectl -n "$ns" get secret "$secret" -o jsonpath='{.data.RAG_API_URL}')" ]]; then
+      put_secret_key "$ns" "$secret" RAG_API_URL "http://rag-api.rag.svc.cluster.local:8000"
+    fi
+    ;;
+esac
 
 kubectl -n rag rollout restart deploy/rag-api >/dev/null
 kubectl -n rag rollout status deploy/rag-api --timeout=180s
