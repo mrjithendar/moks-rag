@@ -12,12 +12,13 @@ from typing import Literal
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-CollectionName = Literal["sre_knowledge", "cms_content", "seo_intel"]
+CollectionName = Literal["sre_knowledge", "cms_content", "seo_intel", "github_repos"]
 
 COLLECTIONS: tuple[CollectionName, ...] = (
     "sre_knowledge",
     "cms_content",
     "seo_intel",
+    "github_repos",
 )
 
 # Version of everything that decides what a stored point looks like: the chunker, the sparse
@@ -60,6 +61,22 @@ VIRTUAL_MODELS: dict[str, dict[str, str]] = {
             "You are the MOKS SEO Intelligence Assistant. Provide concrete, evidence-based "
             "recommendations grounded in the retrieved SEO intelligence documents, citing source "
             "doc_ids/titles."
+        ),
+    },
+    "mrjithendar-repos": {
+        "collection": "github_repos",
+        "description": (
+            "The mrjithendar GitHub repositories' documentation (READMEs, docs, plans; "
+            "rag_api.repo_index)"
+        ),
+        "llm_model": "claude-sonnet-5-5",
+        "system_prompt": (
+            "You are the mrjithendar repositories assistant. Answer from the retrieved "
+            "repository documents only. Name the repository and file each fact comes from, and "
+            "link it with the document's url when it has one. The documents are the default "
+            "branch as of the last nightly index, so say when something may have changed since. "
+            "If the documents do not "
+            "cover the question, say so instead of guessing."
         ),
     },
 }

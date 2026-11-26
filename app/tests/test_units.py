@@ -377,6 +377,22 @@ def test_requirements_match_pyproject() -> None:
     assert all(re.match(r"^[a-z0-9_.\-\[\]]+[<>=]", r) for r in req)
 
 
+def test_documents_carry_their_https_url() -> None:
+    linked = RetrievedChunk(
+        id="1",
+        doc_id="d",
+        score=1.0,
+        text="t",
+        metadata={"url": "https://github.com/o/r/blob/main/a.md"},
+    )
+    other = RetrievedChunk(
+        id="2", doc_id="e", score=1.0, text="t", metadata={"url": "javascript:x"}
+    )
+    block = documents_block([linked, other])
+    assert 'url="https://github.com/o/r/blob/main/a.md"' in block
+    assert "javascript" not in block
+
+
 def test_delimiters_are_neutralized_with_spaces_and_invisible_characters() -> None:
     from rag_api.prompts import condense_request
 
