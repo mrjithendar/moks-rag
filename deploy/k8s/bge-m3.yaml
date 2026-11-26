@@ -237,6 +237,15 @@ spec:
           podSelector:
             matchLabels:
               app: seo-agent
+        # jithendar.com's SEO agent as the `seo-agent` container of the site's pods (moks-cms D-105,
+        # jithendar.com #31): same namespace and service account (default, admitted by the AuthorizationPolicy below).
+        # The app: seo-agent entry above goes once that Deployment is deleted.
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: jithendar
+          podSelector:
+            matchLabels:
+              app: jithendar-com
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: moks-sre
