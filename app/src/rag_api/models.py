@@ -53,6 +53,21 @@ class DeleteDocumentResponse(BaseModel):
     service: str
 
 
+class ListDocumentsRequest(BaseModel):
+    """Which stored documents to list: every doc_id in a collection, or those whose metadata
+    matches every filter exactly."""
+
+    collection: CollectionName
+    filters: dict[str, str | int | float | bool] | None = Field(
+        default=None, description="Exact-match payload metadata filters"
+    )
+
+
+class ListDocumentsResponse(BaseModel):
+    collection: str
+    doc_ids: list[str]
+
+
 class QueryRequest(BaseModel):
     """Hybrid search + grounded LLM generation request."""
 

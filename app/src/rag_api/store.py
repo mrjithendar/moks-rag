@@ -453,6 +453,40 @@ class QdrantStore:
                 wait=True,
             )
 
+    async def list_doc_ids(
+        self, logical: str, filters: dict[str, str | int | float | bool] | None = None
+    ) -> list[str]:
+        """Every stored doc_id (from chunk 0) wherever the collection is written, optionally only
+        those whose payload matches every filter exactly. Sorted, each once.
+        """
+        from qdrant_client import models
+
+        must: list[Any] = [
+            models.FieldCondition(key="chunk_index", match=models.MatchValue(value=0))
+        ]
+        if filters:
+            must.extend(self._filter(filters).must)
+        found: set[str] = set()
+        for physical in await self.write_targets(logical):
+            if filters:
+                await self._ensure_filter_indexes(physical, filters)
+            offset: Any = None
+            while True:
+                points, offset = await self._client.scroll(
+                    collection_name=physical,
+                    scroll_filter=models.Filter(must=must),
+                    limit=_SCROLL_PAGE,
+                    offset=offset,
+                    with_payload=["doc_id"],
+                    with_vectors=False,
+                )
+                found.update(
+                    str(p.payload["doc_id"]) for p in points if (p.payload or {}).get("doc_id")
+                )
+                if offset is None:
+                    break
+        return sorted(found)
+
     async def iter_documents(self, physical: str) -> AsyncIterator[StoredDocument]:
         """Every stored source document (chunk 0 with its `document` payload), newest version per
         doc_id.

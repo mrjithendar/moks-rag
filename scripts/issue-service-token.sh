@@ -21,8 +21,9 @@ case "$service" in
   moks-sre-agent) ns=moks-sre;  secret=moks-rag-client;   key=RAG_BEARER_TOKEN; restart="the MOKS api, worker and crewai Deployments in namespace moks-sre" ;;
   open-webui)     ns=rag;       secret=rag-secrets;       key=OPEN_WEBUI_RAG_TOKEN; restart="" ;;
   rag-admin)      ns=rag;       secret=rag-admin-token;   key=token;            restart="" ;;
+  repo-indexer)   ns=rag;       secret=repo-indexer-rag;  key=RAG_BEARER_TOKEN; restart="" ;;
   *)
-    echo "usage: $0 <moks-cms|moks-seo-agent|moks-sre-agent|open-webui|rag-admin>" >&2
+    echo "usage: $0 <moks-cms|moks-seo-agent|moks-sre-agent|open-webui|rag-admin|repo-indexer>" >&2
     exit 2
     ;;
 esac

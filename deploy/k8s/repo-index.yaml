@@ -1,0 +1,128 @@
+# The GitHub repositories' documents in collection github_repos (chat model mrjithendar-repos): README "Indexing the
+# GitHub repositories". The job is rag-api's image running `python -m rag_api.repo_index`; it reads GitHub and calls
+# rag-api with its own token (service repo-indexer: writes github_repos only), never Qdrant directly.
+#
+# Which repositories and files: the config below. Every repository of `orgs` that is not archived is indexed, so a new
+# repository needs no change here; `exclude_repos` and `exclude` take things out, `extra_repos` ("owner/name", public)
+# adds repositories outside the orgs. A glob "owner/name:glob" applies to that repository only. Edit, push (or
+# kubectl edit), and the next run uses it; files that stop matching are removed from the index by that run.
+#
+# Run it now: kubectl -n rag create job --from=cronjob/repo-index repo-index-$(date +%s)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: repo-index
+  namespace: rag
+  labels:
+    app: repo-index
+    app.kubernetes.io/part-of: rag
+data:
+  config.json: |
+    {
+      "orgs": ["mrjithendar"],
+      "extra_repos": [],
+      "exclude_repos": [],
+      "include": [
+        "**/*.md", "**/*.mdx", "**/*.markdown", "**/*.rst", "**/*.txt", "**/*.adoc",
+        "**/*.pdf", "**/*.docx", "**/*.pptx"
+      ],
+      "exclude": [
+        "mrjithendar/jithendar.com:content/**",
+        "**/node_modules/**", "**/vendor/**", "**/dist/**", "**/build/**", "**/.next/**", "**/.venv/**",
+        "**/.github/**", "**/fixtures/**", "**/diagrams/**",
+        "**/requirements*.txt", "**/LICENSE*", "**/robots.txt"
+      ],
+      "max_file_bytes": null
+    }
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: repo-index
+  namespace: rag
+  labels:
+    app: repo-index
+    app.kubernetes.io/part-of: rag
+automountServiceAccountToken: false
+---
+# Nightly at 02:00 UTC (change `schedule` as you like). One run at a time; a failed run is not retried by Kubernetes:
+# the next night sends what failed again. Its logs are JSON lines: one `repo_index_repo` per repository and a
+# `repo_index_done` summary (files, indexed, unchanged, rejected, failed, deleted, errors).
+# No resources set: Gatekeeper only warns (require-memory-limits); add them here when you want them.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: repo-index
+  namespace: rag
+  labels:
+    app: repo-index
+    app.kubernetes.io/part-of: rag
+spec:
+  schedule: "0 2 * * *"
+  timeZone: "Etc/UTC"
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      template:
+        metadata:
+          labels:
+            app: repo-index
+            app.kubernetes.io/part-of: rag
+        spec:
+          serviceAccountName: repo-index
+          automountServiceAccountToken: false
+          enableServiceLinks: false
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: repo-index
+              image: ghcr.io/mrjithendar/moks-rag-api:latest
+              imagePullPolicy: IfNotPresent
+              command: ["python", "-m", "rag_api.repo_index"]
+              env:
+                - name: REPO_INDEX_CONFIG
+                  value: /etc/repo-index/config.json
+                - name: RAG_URL
+                  value: "http://rag-api.rag.svc.cluster.local:8000"
+                - name: LOG_LEVEL
+                  value: "INFO"
+                # scripts/issue-service-token.sh repo-indexer writes it. Optional only so that a run without it
+                # fails at once ("RAG_BEARER_TOKEN is not set") instead of a pod waiting for the Secret, which
+                # would hold back every later run (concurrencyPolicy Forbid).
+                - name: RAG_BEARER_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: repo-indexer-rag
+                      key: RAG_BEARER_TOKEN
+                      optional: true
+                # Optional: a GitHub token (no scopes needed for public repositories) raises the API limit from 60
+                # calls an hour (shared by the cluster's address) to 5,000. A run makes one call per org.
+                - name: GITHUB_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: repo-index-github
+                      key: GITHUB_TOKEN
+                      optional: true
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              volumeMounts:
+                - name: config
+                  mountPath: /etc/repo-index
+                  readOnly: true
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: config
+              configMap:
+                name: repo-index
+            - name: tmp
+              emptyDir: {}

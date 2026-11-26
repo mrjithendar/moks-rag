@@ -11,6 +11,7 @@ resources:
   - rag-api.yaml
   - open-webui.yaml
   - istio-routing.yaml
+  - repo-index.yaml
   # Never commit plaintext secrets. After generating a SealedSecret or configuring
   # External Secrets Operator from the *.template files in this directory, uncomment:
   # - rag-secrets.sealed-secret.yaml

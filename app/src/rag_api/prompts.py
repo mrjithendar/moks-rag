@@ -67,6 +67,9 @@ def documents_block(chunks: list[RetrievedChunk]) -> str:
         section = chunk.metadata.get("heading_path")
         if section:
             attrs += f' section="{_attr(section)}"'
+        url = chunk.metadata.get("url")
+        if isinstance(url, str) and url.startswith("https://"):
+            attrs += f' url="{_attr(url)}"'
         parts.append(f"<document {attrs}>\n{_neutralize(chunk.text)}\n</document>")
     return "<documents>\n" + "\n".join(parts) + "\n</documents>"
 

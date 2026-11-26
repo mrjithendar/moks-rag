@@ -9,12 +9,13 @@ metadata:
 automountServiceAccountToken: false
 ---
 # What each service may do with its own token (RAG_SERVICE_TOKENS in Secret rag-secrets; README "Access").
-# Collections: sre_knowledge, cms_content, seo_intel, or "*". Write implies read. A service with a token but no
+# Collections: sre_knowledge, cms_content, seo_intel, github_repos, or "*". Write implies read. A service with a token but no
 # entry here may do nothing. The rules mirror what each caller's own client already limits itself to:
 #   moks-cms        writes cms_content (src/lib/rag/sync.ts, doc_id "<post collection>:<slug>")
 #   moks-seo-agent  writes seo_intel, reads cms_content (app/moks_rag.py refuses anything else)
 #   moks-sre-agent  writes sre_knowledge (backend/moks/rag/shared.py)
-#   open-webui      reads every collection (the three virtual models)
+#   repo-indexer    writes github_repos (src/rag_api/repo_index.py, CronJob repo-index; doc_id "owner/name/path")
+#   open-webui      reads every collection (the four virtual models)
 #   rag-admin       index versions (/admin/*); issue its token only when needed
 apiVersion: v1
 kind: ConfigMap
@@ -30,6 +31,7 @@ data:
       "moks-cms": {"read": ["cms_content"], "write": ["cms_content"]},
       "moks-seo-agent": {"read": ["seo_intel", "cms_content"], "write": ["seo_intel"]},
       "moks-sre-agent": {"read": ["sre_knowledge"], "write": ["sre_knowledge"]},
+      "repo-indexer": {"read": ["github_repos"], "write": ["github_repos"]},
       "open-webui": {"read": ["*"]},
       "rag-admin": {"read": ["*"], "write": ["*"], "admin": true}
     }

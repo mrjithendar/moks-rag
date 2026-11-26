@@ -55,6 +55,7 @@ async def test_collections_are_aliases_to_versioned_physical(
         "sre_knowledge": "sre_knowledge__v2",
         "cms_content": "cms_content__v2",
         "seo_intel": "seo_intel__v2",
+        "github_repos": "github_repos__v2",
     }
 
 

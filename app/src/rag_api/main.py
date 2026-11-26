@@ -50,6 +50,8 @@ from rag_api.models import (
     DeleteDocumentResponse,
     IngestJSONRequest,
     IngestResponse,
+    ListDocumentsRequest,
+    ListDocumentsResponse,
     ModelCard,
     ModelListResponse,
     QueryRequest,
@@ -596,6 +598,16 @@ def create_app(
         principal: Principal = AuthDep,
     ) -> DeleteDocumentResponse:
         return await delete_doc(request, principal, doc_id, collection)
+
+    # --- Listing stored documents (a syncing caller finds what it no longer has) ---
+
+    @app.post("/documents/list", response_model=ListDocumentsResponse, tags=["rag"])
+    async def list_documents(
+        payload: ListDocumentsRequest, request: Request, principal: Principal = AuthDep
+    ) -> ListDocumentsResponse:
+        principal.require_read(payload.collection)
+        doc_ids = await request.app.state.qdrant.list_doc_ids(payload.collection, payload.filters)
+        return ListDocumentsResponse(collection=payload.collection, doc_ids=doc_ids)
 
     # --- Hybrid RAG query endpoint ---
 

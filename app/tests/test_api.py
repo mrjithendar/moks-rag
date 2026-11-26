@@ -32,7 +32,12 @@ def test_health_and_ready_do_not_require_auth(client: TestClient) -> None:
     assert client.get("/health").json()["status"] == "ok"
     ready = client.get("/ready")
     assert ready.status_code == 200
-    assert set(ready.json()["collections"]) == {"sre_knowledge", "cms_content", "seo_intel"}
+    assert set(ready.json()["collections"]) == {
+        "sre_knowledge",
+        "cms_content",
+        "seo_intel",
+        "github_repos",
+    }
 
 
 def test_ready_hides_dependency_details(client: TestClient, fakes: dict[str, Any]) -> None:
@@ -237,6 +242,40 @@ def test_delete_by_query_param(client: TestClient) -> None:
     assert resp.json()["collections"] == ["cms_content"]
 
 
+def test_list_documents_by_metadata(client: TestClient) -> None:
+    def put(repo: str, path: str) -> None:
+        meta = {"repo": repo, "path": path}
+        ingest(
+            client, "github_repos", f"{repo}/{path}", f"# {path}\n\nAbout {path}.", metadata=meta
+        )
+
+    put("mrjithendar/moks-rag", "README.md")
+    put("mrjithendar/moks-rag", "docs/a.md")
+    put("mrjithendar/monitoring", "README.md")
+    body = {"collection": "github_repos", "filters": {"repo": "mrjithendar/moks-rag"}}
+    listed = client.post("/documents/list", headers=auth(), json=body)
+    assert listed.status_code == 200
+    assert listed.json()["doc_ids"] == [
+        "mrjithendar/moks-rag/README.md",
+        "mrjithendar/moks-rag/docs/a.md",
+    ]
+    every = client.post("/documents/list", headers=auth(), json={"collection": "github_repos"})
+    assert len(every.json()["doc_ids"]) == 3
+    # Listing needs read access to the collection.
+    denied = client.post(
+        "/documents/list", headers=svc("moks-cms"), json={"collection": "github_repos"}
+    )
+    assert denied.status_code == 403
+    gone = client.delete(
+        "/documents/mrjithendar/moks-rag/docs/a.md",
+        params={"collection": "github_repos"},
+        headers=auth(),
+    )
+    assert gone.status_code == 200
+    again = client.post("/documents/list", headers=auth(), json=body).json()["doc_ids"]
+    assert again == ["mrjithendar/moks-rag/README.md"]
+
+
 def test_query_runs_hybrid_search_and_litellm(client: TestClient, fakes: dict[str, Any]) -> None:
     ingest(client, "sre_knowledge", "runbook-istio-503", RUNBOOK, title="Istio 503 Runbook")
     resp = client.post(
@@ -351,7 +390,7 @@ def test_upstream_errors_map_to_http_status(client: TestClient, fakes: dict[str,
 
 def test_openai_models_and_chat_completions(client: TestClient, fakes: dict[str, Any]) -> None:
     ids = {m["id"] for m in client.get("/v1/models", headers=auth()).json()["data"]}
-    assert ids == {"moks-sre", "moks-cms", "moks-seo-agent"}
+    assert ids == {"moks-sre", "moks-cms", "moks-seo-agent", "mrjithendar-repos"}
 
     chat_resp = client.post(
         "/v1/chat/completions",

@@ -22,6 +22,7 @@ All components run in the `rag` namespace and communicate over internal Kubernet
 | `moks-sre` | `sre_knowledge` | `dense` (1024 cosine) + `sparse` (BM25/IDF) | `moks-sre` runbooks & incidents |
 | `moks-cms` | `cms_content` | `dense` (1024 cosine) + `sparse` (BM25/IDF) | `moks-cms` articles & webhook sync |
 | `moks-seo-agent` | `seo_intel` | `dense` (1024 cosine) + `sparse` (BM25/IDF) | `moks-seo-agent` audits & SERP intel |
+| `mrjithendar-repos` | `github_repos` | `dense` (1024 cosine) + `sparse` (BM25/IDF) | the GitHub repositories' documentation, nightly ([Indexing the GitHub repositories](#indexing-the-github-repositories)) |
 
 ---
 
@@ -43,6 +44,7 @@ moks-rag/
 │   │   ├── prompts.py     # fixed system prompt, documents as data in the user turn
 │   │   ├── rerank.py      # optional int8 cross-encoder (off)
 │   │   ├── metrics.py     # Prometheus
+│   │   ├── repo_index.py  # python -m rag_api.repo_index (CronJob repo-index)
 │   │   └── eval.py        # python -m rag_api.eval
 │   ├── tests/
 │   ├── Dockerfile
@@ -58,6 +60,7 @@ moks-rag/
 │   │   ├── rag-api.yaml
 │   │   ├── open-webui.yaml
 │   │   ├── istio-routing.yaml
+│   │   ├── repo-index.yaml      # what to index from GitHub + the nightly CronJob
 │   │   ├── rag-secrets.sealed-secret.yaml.template
 │   │   └── rag-secrets.external-secret.yaml.template
 │   └── argocd/                          # ArgoCD AppProject + Applications + Qdrant Helm values
@@ -295,23 +298,59 @@ How `/docling` works: the `docling-serve` VirtualService in `deploy/k8s/istio-ro
 
 ---
 
+## Indexing the GitHub repositories
+
+The chat model **`mrjithendar-repos`** answers from the documentation of the GitHub repositories (collection `github_repos`). CronJob `repo-index` (`deploy/k8s/repo-index.yaml`) fills it every night at 02:00 UTC with `python -m rag_api.repo_index` from the rag-api image:
+
+1. It lists every repository of `mrjithendar` that is not archived (one GitHub API call), so **a new repository is indexed by the next run without any change**.
+2. For each, it downloads the default branch as one tarball and takes the files that match `include` and no `exclude` glob in the config: Markdown, MDX, reStructuredText, text, PDF, DOCX and PPTX, without `jithendar.com/content/` (the blog posts: moks-cms indexes them into `cms_content`), test fixtures, diagram captions, `node_modules` and the like.
+3. Each file is one document, `doc_id` `owner/name/path`, sent to rag-api one at a time: text as text, PDF/DOCX/PPTX as an upload that rag-api converts with docling-serve. Its metadata has `repo`, `path`, `branch`, `url` (the file on GitHub) and `blob_sha`, so an unchanged file is answered `unchanged` without embedding anything, and answers can link to the file.
+4. Then it deletes what is gone: files removed from a repository or no longer matching, and every document of a repository that was deleted, archived or excluded. Nothing is deleted when listing GitHub failed or a repository could not be read.
+
+On 2026-11-26 that was 11 repositories, 419 files, 3.6 MB of text (one PDF); the first run embeds all of it, later runs only what changed.
+
+**Adding or removing repositories and files:** edit the `config.json` in ConfigMap `repo-index` (PR, or `kubectl -n rag edit configmap repo-index`):
+
+| Key | Meaning |
+| --- | --- |
+| `orgs` | every non-archived repository of these orgs |
+| `extra_repos` | more repositories, `"owner/name"` (public, or reachable with `GITHUB_TOKEN`) |
+| `exclude_repos` | `"owner/name"` never indexed |
+| `include`, `exclude` | path globs: `**/` any directories (none included), `*` anything but `/`; `"owner/name:glob"` applies to one repository |
+| `max_file_bytes` | skip larger files; `null` = no limit |
+
+**Once, before the first run:**
+
+```bash
+scripts/issue-service-token.sh repo-indexer            # Secret rag/repo-indexer-rag; restarts rag-api
+# optional, raises the GitHub API limit (60 calls an hour without it, shared by the cluster's address):
+kubectl -n rag create secret generic repo-index-github --from-literal=GITHUB_TOKEN=<token, no scopes needed>
+kubectl -n rag create job --from=cronjob/repo-index repo-index-first     # or wait for 02:00 UTC
+kubectl -n rag logs -f job/repo-index-first -c repo-index
+```
+
+Each repository logs a `repo_index_repo` line (files, indexed, unchanged, rejected, failed, deleted) and the run ends with `repo_index_done`. The job fails (exit 1) when anything failed; the next run sends it again. `rejected` (rag-api answered 422: an empty file, a chunk too long, a PDF without text) is logged, not failed. In Open WebUI the model appears as `mrjithendar-repos`; if a user does not see it, check its visibility in Admin Panel → Settings → Models.
+
+---
+
 ## API contract (0.2.0)
 
 | Endpoint | Scope | Notes |
 | --- | --- | --- |
 | `POST /ingest` | write on `collection` | JSON or multipart (`file` via docling-serve). **`doc_id` is required**: sending the same `doc_id` again replaces the document. The answer has `unchanged: true` when the stored version was identical (nothing embedded or written). A chunk too long for bge-m3's context is refused with 422 instead of being embedded from its start only. |
 | `DELETE /documents/{doc_id}?collection=…` | write | **`collection` is required** (`all` = every collection the caller may write). `doc_id` may contain `/`. Also `DELETE /documents?doc_id=…&collection=…`. |
+| `POST /documents/list` | read | `{collection, filters}` → `{doc_ids}`: every stored doc_id, or those whose metadata matches every filter exactly (a syncing caller finds what it no longer has). |
 | `POST /query` | read | Each source has `score` (rank fusion: orders one answer only), **`dense_score`** (cosine similarity, comparable across queries) and `rerank_score` when the reranker ran. `min_dense_score` drops chunks below a cosine floor. `filters` match payload fields exactly (not `text` or `document*`; the first filter on a field indexes it). `model` must be `DEFAULT_LLM_MODEL` or `FAST_LLM_MODEL`. |
 | `GET /v1/models`, `POST /v1/chat/completions` | read on the model's collection | OpenAI-compatible, for Open WebUI. Follow-ups are rewritten into a standalone search query with `FAST_LLM_MODEL` (`CONDENSE_FOLLOWUPS`). Open WebUI's background tasks (title, tags, follow-ups: messages starting `### Task:`) skip retrieval and use `FAST_LLM_MODEL`. |
 | `GET /admin/collections`, `POST /admin/collections/{name}/rebuild`, `…/promote`, `DELETE /admin/physical/{name}` | admin | [Index versions](#index-versions). |
 
-Prompts: the system prompt is fixed per model; retrieved chunks go in the user turn inside `<documents><document doc_id=… title=… section=…>` and the system prompt says they are data, not instructions (retrieved text can come from third-party pages, e.g. `seo_intel`).
+Prompts: the system prompt is fixed per model; retrieved chunks go in the user turn inside `<documents><document doc_id=… title=… section=… url=…>` (`url` when the document's metadata has an `https://` one) and the system prompt says they are data, not instructions (retrieved text can come from third-party pages, e.g. `seo_intel`).
 
 Errors name the dependency that failed: `503` unreachable, `504` too slow, `429` rate-limited (with `Retry-After`), `502` anything else, body `{"detail", "dependency", "kind", "request_id"}`. A stream that fails after it started ends with an SSE `{"error": …}` event and `[DONE]`.
 
 ## Access: per-service tokens
 
-Every caller can get its own token, limited by the access policy in `deploy/k8s/rag-api.yaml` (ConfigMap `rag-api-access`): `moks-cms` writes `cms_content`; `moks-seo-agent` writes `seo_intel` and reads `cms_content`; `moks-sre-agent` writes `sre_knowledge`; `open-webui` reads everything; `rag-admin` may use `/admin/*`. With its own token, a caller's logs and metrics carry the token's service, whatever `X-Service-Name` says.
+Every caller can get its own token, limited by the access policy in `deploy/k8s/rag-api.yaml` (ConfigMap `rag-api-access`): `moks-cms` writes `cms_content`; `moks-seo-agent` writes `seo_intel` and reads `cms_content`; `moks-sre-agent` writes `sre_knowledge`; `repo-indexer` writes `github_repos`; `open-webui` reads everything; `rag-admin` may use `/admin/*`. With its own token, a caller's logs and metrics carry the token's service, whatever `X-Service-Name` says.
 
 The 0.1.0 shared `RAG_BEARER_TOKEN` keeps full access while `RAG_SHARED_TOKEN_ENABLED` is `"true"`, so nothing breaks during the move. To move one caller (no code change in the caller: each one already reads its token from its own Secret):
 
@@ -320,6 +359,7 @@ scripts/issue-service-token.sh moks-cms         # Secret jithendar/jithendar-com
 scripts/issue-service-token.sh moks-seo-agent   # Secret jithendar/seo-agent-rag (RAG_BEARER_TOKEN)
 scripts/issue-service-token.sh moks-sre-agent   # Secret moks-sre/moks-rag-client (RAG_BEARER_TOKEN)
 scripts/issue-service-token.sh open-webui       # rag-secrets OPEN_WEBUI_RAG_TOKEN
+scripts/issue-service-token.sh repo-indexer     # Secret rag/repo-indexer-rag (RAG_BEARER_TOKEN), for CronJob repo-index
 ```
 
 Then restart the caller it names and check rag-api's log lines show `"auth": "service-token"` for it. When no request uses `"auth": "shared-token"` any more, set `RAG_SHARED_TOKEN_ENABLED` to `"false"` in `deploy/k8s/rag-api.yaml`. Open WebUI keeps its connection key in its database once it was saved in Admin → Settings → Connections; then paste the new token there too.
