@@ -1,0 +1,315 @@
+# Migrated from k8s-deployments/deploy/minikube/embeddings/bge-m3 into the `rag` namespace.
+# Runs BAAI/bge-m3:567m (1024-dim dense vectors) via Ollama on CPU (ARM64 compatible for Hetzner CAX nodes).
+# Service exposes both :8001 (rag-api standard) and :11434 (legacy Ollama port for moks-sre & seo-agent).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: bge-m3
+  namespace: rag
+  labels:
+    app: bge-m3
+    app.kubernetes.io/part-of: rag
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: bge-m3-models
+  namespace: rag
+  labels:
+    app: bge-m3
+    app.kubernetes.io/part-of: rag
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: hcloud-volumes
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bge-m3
+  namespace: rag
+  labels:
+    app: bge-m3
+    app.kubernetes.io/part-of: rag
+spec:
+  replicas: 1
+  # ReadWriteOnce volume: terminate old pod before mounting on a replacement pod.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: bge-m3
+  template:
+    metadata:
+      labels:
+        app: bge-m3
+        app.kubernetes.io/part-of: rag
+    spec:
+      serviceAccountName: bge-m3
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        - name: fetch-model
+          image: ollama/ollama:0.40.16@sha256:910d0d8107b538fb0894e63163eb195de0cc7aefcbc666dc62d3b18f71124592
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              manifest="$OLLAMA_MODELS/manifests/registry.ollama.ai/library/${MODEL%%:*}/${MODEL##*:}"
+              blob="$OLLAMA_MODELS/blobs/$(echo "$MODEL_DIGEST" | tr ':' '-')"
+              if [ -f "$manifest" ] && [ -f "$blob" ] && grep -q "$MODEL_DIGEST" "$manifest"; then
+                echo "$MODEL ($MODEL_DIGEST) is already on the volume"
+                exit 0
+              fi
+              ollama serve >/tmp/fetch-model.log 2>&1 &
+              server=$!
+              i=0
+              until ollama list >/dev/null 2>&1; do
+                i=$((i + 1))
+                if [ "$i" -ge 60 ]; then cat /tmp/fetch-model.log; exit 1; fi
+                sleep 1
+              done
+              ollama pull "$MODEL"
+              kill "$server"
+              wait "$server" || true
+              if ! grep -q "$MODEL_DIGEST" "$manifest"; then
+                echo "$MODEL: downloaded weights do not match $MODEL_DIGEST; refusing to serve" >&2
+                exit 1
+              fi
+              echo "$MODEL ($MODEL_DIGEST) downloaded"
+          env:
+            - name: MODEL
+              value: "bge-m3:567m"
+            - name: MODEL_DIGEST
+              value: "sha256:daec91ffb5dd0c27411bd71f29932917c49cf529a641d0168496c3a501e3062c"
+            - name: OLLAMA_MODELS
+              value: /models
+            - name: OLLAMA_HOST
+              value: 127.0.0.1:11434
+            - name: HOME
+              value: /home/ollama
+          volumeMounts:
+            - name: models
+              mountPath: /models
+            - name: home
+              mountPath: /home/ollama
+            - name: tmp
+              mountPath: /tmp
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 1Gi
+      containers:
+        - name: ollama
+          image: ollama/ollama:0.40.16@sha256:910d0d8107b538fb0894e63163eb195de0cc7aefcbc666dc62d3b18f71124592
+          imagePullPolicy: IfNotPresent
+          args: ["serve"]
+          env:
+            - name: OLLAMA_HOST
+              value: 0.0.0.0:11434
+            - name: OLLAMA_MODELS
+              value: /models
+            - name: HOME
+              value: /home/ollama
+            - name: OLLAMA_KEEP_ALIVE
+              value: "-1"
+            - name: OLLAMA_MAX_LOADED_MODELS
+              value: "1"
+            - name: OLLAMA_NUM_PARALLEL
+              value: "2"
+            - name: OLLAMA_CONTEXT_LENGTH
+              value: "2048"
+          ports:
+            - name: http
+              containerPort: 11434
+          startupProbe:
+            httpGet:
+              path: /
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 60
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 5
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          volumeMounts:
+            - name: models
+              mountPath: /models
+            - name: home
+              mountPath: /home/ollama
+            - name: tmp
+              mountPath: /tmp
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          # Intentionally no CPU limit: Ollama sizes its thread pool to node cores and CFS quotas stall batches.
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1536Mi
+            limits:
+              memory: 2560Mi
+      volumes:
+        - name: models
+          persistentVolumeClaim:
+            claimName: bge-m3-models
+        - name: home
+          emptyDir:
+            sizeLimit: 16Mi
+        - name: tmp
+          emptyDir:
+            sizeLimit: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: bge-m3
+  namespace: rag
+  labels:
+    app: bge-m3
+    app.kubernetes.io/part-of: rag
+spec:
+  type: ClusterIP
+  selector:
+    app: bge-m3
+  ports:
+    - name: http-rag
+      port: 8001
+      targetPort: http
+      appProtocol: http
+    - name: http
+      port: 11434
+      targetPort: http
+      appProtocol: http
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: bge-m3
+  namespace: rag
+  labels:
+    app: bge-m3
+    app.kubernetes.io/part-of: rag
+spec:
+  podSelector:
+    matchLabels:
+      app: bge-m3
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: rag-api
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: jithendar
+          podSelector:
+            matchLabels:
+              app: seo-agent
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: moks-sre
+          podSelector:
+            matchLabels:
+              app: moks
+      ports:
+        - port: 11434
+          protocol: TCP
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - port: 15020
+          protocol: TCP
+        - port: 15090
+          protocol: TCP
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: istio-system
+      ports:
+        - port: 15012
+          protocol: TCP
+    # Model weight pull from registry.ollama.ai (public internet only)
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 100.64.0.0/10
+              - 169.254.0.0/16
+      ports:
+        - port: 443
+          protocol: TCP
+---
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: bge-m3
+  namespace: rag
+  labels:
+    app: bge-m3
+    app.kubernetes.io/part-of: rag
+spec:
+  selector:
+    matchLabels:
+      app: bge-m3
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            principals:
+              - "cluster.local/ns/rag/sa/rag-api"
+              - "cluster.local/ns/jithendar/sa/default"
+              - "cluster.local/ns/moks-sre/sa/moks"
+      to:
+        - operation:
+            ports: ["11434"]
+            methods: ["GET", "POST"]

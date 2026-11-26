@@ -1,0 +1,79 @@
+# Official Qdrant Helm chart values for CPU-only Hetzner k3s (ARM64).
+# Managed by ArgoCD via deploy/argocd/qdrant-app.yaml.
+
+replicaCount: 1
+
+podLabels:
+  app: qdrant
+  app.kubernetes.io/part-of: rag
+
+service:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 6333
+      targetPort: 6333
+      protocol: TCP
+    - name: grpc
+      port: 6334
+      targetPort: 6334
+      protocol: TCP
+
+# Disable chart-managed plaintext/auto-generated Secret; inject API key from `rag-secrets`.
+apiKey: false
+
+env:
+  - name: QDRANT__SERVICE__API_KEY
+    valueFrom:
+      secretKeyRef:
+        name: rag-secrets
+        key: QDRANT_API_KEY
+
+config:
+  telemetry_disabled: true
+  storage:
+    on_disk_payload: true
+
+persistence:
+  accessModes:
+    - ReadWriteOnce
+  size: 15Gi
+  # Portable Hetzner CSI block volume; change to `local-path` if you prefer node-local storage.
+  storageClassName: hcloud-volumes
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    cpu: "2"
+    memory: 2Gi
+
+livenessProbe:
+  enabled: true
+  initialDelaySeconds: 10
+  periodSeconds: 20
+  timeoutSeconds: 5
+  failureThreshold: 6
+
+readinessProbe:
+  enabled: true
+  initialDelaySeconds: 5
+  periodSeconds: 10
+  timeoutSeconds: 5
+  failureThreshold: 3
+
+startupProbe:
+  enabled: true
+  initialDelaySeconds: 5
+  periodSeconds: 5
+  timeoutSeconds: 3
+  failureThreshold: 30
+
+# Keep Qdrant strictly internal (ClusterIP only)
+ingress:
+  enabled: false
+
+metrics:
+  serviceMonitor:
+    enabled: false

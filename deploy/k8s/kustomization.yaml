@@ -1,0 +1,21 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: rag
+
+resources:
+  - namespace.yaml
+  - bge-m3.yaml
+  - docling-serve.yaml
+  - litellm.yaml
+  - rag-api.yaml
+  - open-webui.yaml
+  - istio-routing.yaml
+  # Never commit plaintext secrets. After generating a SealedSecret or configuring
+  # External Secrets Operator from the *.template files in this directory, uncomment:
+  # - rag-secrets.sealed-secret.yaml
+
+images:
+  - name: ghcr.io/mrjithendar/moks-rag-api
+    newName: ghcr.io/mrjithendar/moks-rag-api
+    newTag: latest

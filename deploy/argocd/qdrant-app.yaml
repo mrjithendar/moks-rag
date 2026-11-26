@@ -1,0 +1,37 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: moks-rag-qdrant
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: moks-rag
+  sources:
+    - repoURL: https://qdrant.github.io/qdrant-helm
+      chart: qdrant
+      # Semver range tracks 1.x chart releases; pin an exact version (e.g. "1.13.6") for strict immutability.
+      targetRevision: "1.*"
+      helm:
+        releaseName: qdrant
+        valueFiles:
+          - $values/deploy/argocd/qdrant-values.yaml
+    - repoURL: https://github.com/mrjithendar/moks-rag.git
+      targetRevision: main
+      ref: values
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: rag
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - PruneLast=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 10s
+        factor: 2
+        maxDuration: 3m
