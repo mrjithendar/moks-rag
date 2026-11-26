@@ -37,8 +37,20 @@ spec:
           image: ghcr.io/docling-project/docling-serve-cpu:latest@sha256:38d98a8016f6e6220bda0e11d579ffcfa27055d82bbebc22fc346eaf737105dd
           imagePullPolicy: IfNotPresent
           env:
+            # The Web UI at https://jithendar.com/docling (README, Browsing docling-serve). It takes its API address from
+            # its own URL (everything before /ui), so it works under the prefix as shipped. Only the gateway's login
+            # (edge chart basicAuth "docling") guards it: docling-serve itself has no API key here.
             - name: DOCLING_SERVE_ENABLE_UI
-              value: "0"
+              value: "1"
+            # The public prefix, for the links FastAPI writes: /docling/docs and /docling/swagger then load
+            # /docling/openapi.json, and /ui redirects to /docling/ui/. Requests still arrive without the prefix (the
+            # VirtualService strips it), so rag-api's calls and the probes are unchanged.
+            - name: UVICORN_ROOT_PATH
+              value: "/docling"
+            # Only the UI calls from a browser, and it is same-origin. The default ("*") would also answer other sites'
+            # pages sending the owner's browser login along.
+            - name: DOCLING_SERVE_CORS_ORIGINS
+              value: '["https://jithendar.com"]'
             - name: DOCLING_SERVE_HOST
               value: "0.0.0.0"
             - name: DOCLING_SERVE_PORT
