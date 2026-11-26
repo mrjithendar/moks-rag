@@ -180,6 +180,7 @@ class QdrantStore:
 
         self._dim = settings.embedding_dim
         self._prefetch_limit = settings.prefetch_limit
+        self._collections_ensured = False
         self._client = client or AsyncQdrantClient(
             url=settings.qdrant_url,
             api_key=settings.qdrant_api_key or None,
@@ -191,6 +192,8 @@ class QdrantStore:
 
     async def healthcheck(self) -> bool:
         await self._client.get_collections()
+        if not self._collections_ensured:
+            await self.ensure_collections()
         return True
 
     async def ensure_collections(self) -> None:
@@ -224,6 +227,12 @@ class QdrantStore:
                 field_schema=models.PayloadSchemaType.KEYWORD,
             )
 
+        self._collections_ensured = True
+
+    async def _ensure_ready(self) -> None:
+        if not self._collections_ensured:
+            await self.ensure_collections()
+
     async def upsert_chunks(
         self,
         collection: CollectionName,
@@ -236,6 +245,7 @@ class QdrantStore:
         """Replace existing chunks for doc_id and upsert fresh dense+sparse points."""
         from qdrant_client import models
 
+        await self._ensure_ready()
         # Remove prior chunks for this doc_id so re-indexing never leaves orphan tail chunks.
         await self.delete_document(collection=collection, doc_id=doc_id)
 
@@ -272,6 +282,7 @@ class QdrantStore:
         """Delete all chunks matching doc_id from the target collection."""
         from qdrant_client import models
 
+        await self._ensure_ready()
         await self._client.delete(
             collection_name=collection,
             points_selector=models.FilterSelector(
@@ -298,6 +309,7 @@ class QdrantStore:
         """Execute Qdrant hybrid prefetch (dense + sparse) with Reciprocal Rank Fusion (RRF)."""
         from qdrant_client import models
 
+        await self._ensure_ready()
         query_filter: models.Filter | None = None
         if filters:
             query_filter = models.Filter(
