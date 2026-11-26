@@ -44,6 +44,12 @@ def test_health_and_ready_do_not_require_auth(client: TestClient) -> None:
     assert set(ready.json()["collections"]) == {"sre_knowledge", "cms_content", "seo_intel"}
 
 
+def test_root_redirects_to_docs(client: TestClient) -> None:
+    root = client.get("/", follow_redirects=False)
+    assert root.status_code == 307
+    assert root.headers["location"] == "/rag/docs"
+
+
 def test_auth_rejects_missing_or_wrong_token(client: TestClient) -> None:
     assert client.get("/v1/models").status_code == 401
     assert (

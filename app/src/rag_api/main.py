@@ -12,7 +12,7 @@ from typing import Any, Literal
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
-from fastapi.responses import StreamingResponse
+from fastapi.responses import RedirectResponse, StreamingResponse
 
 from rag_api import __version__
 from rag_api.auth import (
@@ -121,6 +121,12 @@ def create_app(
     )
     app.state.settings = cfg
     app.add_middleware(ServiceLoggingMiddleware)
+
+    # --- Landing: https://jithendar.com/rag has nothing to show, so send browsers to the docs ---
+
+    @app.get("/", include_in_schema=False)
+    async def root() -> RedirectResponse:
+        return RedirectResponse(url=f"{cfg.root_path}/docs")
 
     # --- Health & readiness probes (unauthenticated for kubelet) ---
 
