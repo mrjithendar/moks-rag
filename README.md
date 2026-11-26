@@ -4,7 +4,7 @@ Production, CPU-only Hybrid RAG platform deployed in the `rag` namespace on Hetz
 
 ## Architecture
 
-All components run in the `rag` namespace and communicate over internal Kubernetes DNS (`*.rag.svc.cluster.local`). Only `rag-api` (`https://jithendar.com/rag`) and `open-webui` (`https://jithendar.com/chat`) are exposed through the Istio ingress gateway (`istio-ingress/public`); every backend service is strictly `ClusterIP`-only.
+All components run in the `rag` namespace and communicate over internal Kubernetes DNS (`*.rag.svc.cluster.local`). Only `rag-api` (`https://jithendar.com/rag`), `open-webui` (`https://jithendar.com/chat`) and Qdrant's REST port with its Web UI (`https://jithendar.com/qdrant`, behind Qdrant's API key, see [Browsing Qdrant](#browsing-qdrant)) are exposed through the Istio ingress gateway (`istio-ingress/public`); every other backend service is strictly `ClusterIP`-only.
 
 | Component | Image / Chart | Internal Endpoint | Purpose |
 | --- | --- | --- | --- |
@@ -116,13 +116,14 @@ Two optional keys are added later by `scripts/issue-service-token.sh` (see [Acce
 
 ### 2. Wire `jithendar.com/rag` and `jithendar.com/chat` in the Edge Gateway
 
-In your cluster edge chart (`k8s-deployments/deploy/minikube/istio/edge/values.yaml`), add two delegates under `root.delegates` so the shared `istio-ingress/jithendar-com` root VirtualService delegates `/rag` and `/chat`:
+In your cluster edge chart (`k8s-deployments/deploy/minikube/istio/edge/values.yaml`), add three delegates under `root.delegates` so the shared `istio-ingress/jithendar-com` root VirtualService delegates `/rag`, `/chat` and `/qdrant`:
 
 ```yaml
 root:
   delegates:
     - {name: rag, prefix: /rag, to: rag/rag-api}     # <-- add
     - {name: chat, prefix: /chat, to: rag/open-webui} # <-- add
+    - {name: qdrant, prefix: /qdrant, to: rag/qdrant} # <-- add
 ```
 
 > **Open WebUI under `/chat`:** its prebuilt SvelteKit frontend assumes `/`. `deploy/k8s/open-webui.yaml`'s `patch_subpath.py` rewrites it at start-up and then verifies the result: if a new Open WebUI build no longer matches, the container refuses to start (visible in Argo CD) instead of serving a `/chat` that loads nothing. The image is pinned by digest for that reason.
@@ -250,6 +251,25 @@ curl -fsSI https://jithendar.com/chat/health
 ```
 
 Open `https://jithendar.com/chat/` in your browser, sign in (the first registered admin account is created on initial setup; `ENABLE_SIGNUP=false` prevents further public signups), and select **`moks-sre`**, **`moks-cms`**, or **`moks-seo-agent`** from the model selector.
+
+---
+
+## Browsing Qdrant
+
+Qdrant's own Web UI is at **https://jithendar.com/qdrant/dashboard** (`/qdrant` redirects there). It lists the collections (the `__v2` physical collections; `cms_content`, `seo_intel` and `sre_knowledge` are aliases of them) and pages through their points: one point per chunk, with its payload (`doc_id`, `title`, `heading_path`, `text`, ...; chunk 0 also holds the source document). Filter by a payload field (`doc_id:blog:...`) or look a point up by id.
+
+The UI asks for an API key and keeps it in the browser's localStorage. jithendar.com is one origin for the site and every admin tool, so any script on the site can read that key. Give the UI a **read-only key**, which can browse and search but not change or delete anything:
+
+```bash
+kubectl -n rag patch secret rag-secrets --type merge \
+  -p "{\"stringData\":{\"QDRANT_READ_ONLY_API_KEY\":\"$(openssl rand -hex 32)\"}}"
+kubectl -n rag rollout restart statefulset qdrant     # Qdrant reads its keys at start-up
+kubectl -n rag get secret rag-secrets -o jsonpath='{.data.QDRANT_READ_ONLY_API_KEY}' | base64 -d | pbcopy
+```
+
+Paste it in the UI (key icon, top right). The full `QDRANT_API_KEY` works too, but then the UI can delete collections.
+
+How `/qdrant` works: the `qdrant` VirtualService in `deploy/k8s/istio-routing.yaml` strips the prefix and sets `Cache-Control: no-store` on everything except the UI's hashed files, so Cloudflare never keeps an API answer; the `qdrant-ingress` AuthorizationPolicy lets the gateway reach port 6333 only. This Qdrant build's UI loads its files from `/dashboard/...` and its API client ignores the path of its URL, so start-up copies the UI and patches it for `/qdrant` (`args` in `deploy/argocd/qdrant-values.yaml`). After a chart upgrade, check Qdrant's log for `dashboard-ui: Web UI patched for /qdrant/dashboard`; a `WARNING` there means only the UI under `/qdrant` broke, and the patch needs updating.
 
 ---
 

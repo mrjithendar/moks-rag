@@ -28,6 +28,58 @@ env:
       secretKeyRef:
         name: rag-secrets
         key: QDRANT_API_KEY
+  # Optional key that can only read (browse collections, scroll, search). Meant for the Web UI at
+  # https://jithendar.com/qdrant/dashboard: the UI keeps the key it is given in localStorage, which every script on
+  # jithendar.com can read, so a read-only key there cannot change or delete anything. Unset until rag-secrets has
+  # QDRANT_READ_ONLY_API_KEY (README "Browsing Qdrant").
+  - name: QDRANT__SERVICE__READ_ONLY_API_KEY
+    valueFrom:
+      secretKeyRef:
+        name: rag-secrets
+        key: QDRANT_READ_ONLY_API_KEY
+        optional: true
+  # The Web UI copy that start-up patches for /qdrant (args below).
+  - name: QDRANT__SERVICE__STATIC_CONTENT_DIR
+    value: /qdrant/dashboard-ui
+
+# The Web UI at https://jithendar.com/qdrant/dashboard (deploy/k8s/istio-routing.yaml, VirtualService qdrant). Qdrant
+# serves it at /dashboard and the gateway strips /qdrant, but this build loads its files from absolute /dashboard/...
+# paths, and its API client drops the path of the URL it is given, so it would call jithendar.com/collections. Before
+# Qdrant starts, the UI is copied into an emptyDir (the root filesystem is read-only) with three changes:
+#   1. "/dashboard/, "/dashboard# and (/dashboard/ get the /qdrant prefix (scripts, workers, fonts, openapi.json);
+#   2. the API client gets /qdrant as its path prefix (it uses the page's host and port as before);
+#   3. snapshot downloads use a path relative to the API URL instead of /collections/....
+# Every start copies the image's original again, so a container restart patches once, not twice. When a new Qdrant
+# version no longer matches, the log says so and only the UI under /qdrant breaks: Qdrant starts either way. The chart's
+# own args are ./config/initialize.sh, run at the end.
+args:
+  - |
+    prefix=/qdrant
+    src=/qdrant/static
+    dst=/qdrant/dashboard-ui
+    cp -R "$src/." "$dst/" &&
+      for f in "$src"/index.html "$src"/assets/*.js "$src"/assets/*.css; do
+        sed -e 's|\([("]\)/dashboard\([/#]\)|\1'"$prefix"'/dashboard\2|g' \
+            -e 's#this\._restUri=`\${this\._scheme}://\${\([A-Za-z_$][A-Za-z0-9_$]*\)}\${this\._prefix}`#this._restUri=`${this._scheme}://${\1}${this._prefix||"'"$prefix"'"}`#' \
+            -e 's#new URL(`/collections/#new URL(`collections/#g' \
+            "$f" > "$dst/${f#"$src"/}" || break
+      done
+    if grep -q "\"$prefix/dashboard/assets/" "$dst/index.html" &&
+      grep -q "_prefix||\"$prefix\"" "$dst"/assets/*.js &&
+      ! grep -q 'new URL(`/collections/' "$dst"/assets/*.js; then
+      echo "dashboard-ui: Web UI patched for $prefix/dashboard"
+    else
+      echo "dashboard-ui: WARNING: this Qdrant's Web UI no longer matches the patch, $prefix/dashboard will not work (Qdrant itself is not affected)"
+    fi
+    exec ./config/initialize.sh
+
+additionalVolumes:
+  - name: dashboard-ui
+    emptyDir: {}
+
+additionalVolumeMounts:
+  - name: dashboard-ui
+    mountPath: /qdrant/dashboard-ui
 
 config:
   telemetry_disabled: true
