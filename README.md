@@ -10,7 +10,7 @@ All components run in the `rag` namespace and communicate over internal Kubernet
 | --- | --- | --- | --- |
 | `bge-m3` | `ollama/ollama:0.40.16` (`bge-m3:567m`) | `http://bge-m3.rag.svc.cluster.local:8001` (and `:11434`) | 1024-dim dense embeddings on ARM64 CPU (migrated from `embeddings` namespace) |
 | `qdrant` | Helm `qdrant/qdrant` chart `1.20.2` (ArgoCD multi-source) | `http://qdrant.rag.svc.cluster.local:6333` | Vector store (`15Gi` PVC; 3 aliases over versioned dense+sparse collections, see [Index versions](#index-versions)) |
-| `docling-serve` | `ghcr.io/docling-project/docling-serve-cpu` 1.39.0, pinned by digest | `http://docling-serve.rag.svc.cluster.local:5001` | Document parsing (PDF/DOCX/HTML -> Markdown via its async API, 2–4Gi RAM) |
+| `docling-serve` | `ghcr.io/docling-project/docling-serve-cpu` 1.39.0, pinned by digest | `http://docling-serve.rag.svc.cluster.local:5001` | Document parsing (PDF/DOCX/HTML -> Markdown via its async API, 2–4Gi RAM); Web UI at `jithendar.com/docling` behind the gateway's login |
 | `litellm` | `ghcr.io/berriai/litellm`, pinned by digest | `http://litellm.rag.svc.cluster.local:4000/v1` | OpenAI-compatible proxy routing `claude-sonnet-5-5` & `claude-haiku-5-5` |
 | `rag-api` | `ghcr.io/mrjithendar/moks-rag-api:<sha>` | `http://rag-api.rag.svc.cluster.local:8000` (metrics `:9464`) | Custom FastAPI orchestrator (`root_path="/rag"`) |
 | `open-webui` | `ghcr.io/open-webui/open-webui`, pinned by digest | `http://open-webui.rag.svc.cluster.local:80` | Chat UI (`2Gi` PVC) pointing at `rag-api` `/v1` |
@@ -116,7 +116,7 @@ Two optional keys are added later by `scripts/issue-service-token.sh` (see [Acce
 
 ### 2. Wire `jithendar.com/rag` and `jithendar.com/chat` in the Edge Gateway
 
-In your cluster edge chart (`k8s-deployments/deploy/minikube/istio/edge/values.yaml`), add three delegates under `root.delegates` so the shared `istio-ingress/jithendar-com` root VirtualService delegates `/rag`, `/chat` and `/qdrant`:
+In your cluster edge chart (`k8s-deployments/deploy/minikube/istio/edge/values.yaml`), add four delegates under `root.delegates` so the shared `istio-ingress/jithendar-com` root VirtualService delegates `/rag`, `/chat`, `/qdrant` and `/docling`, and a gateway login for `/docling` (see [Browsing docling-serve](#browsing-docling-serve)):
 
 ```yaml
 root:
@@ -124,6 +124,9 @@ root:
     - {name: rag, prefix: /rag, to: rag/rag-api}     # <-- add
     - {name: chat, prefix: /chat, to: rag/open-webui} # <-- add
     - {name: qdrant, prefix: /qdrant, to: rag/qdrant} # <-- add
+    - {name: docling, prefix: /docling, to: rag/docling-serve} # <-- add
+basicAuth:
+  - {name: docling, prefix: /docling, from: rag/docling-ui-auth} # <-- add
 ```
 
 > **Open WebUI under `/chat`:** its prebuilt SvelteKit frontend assumes `/`. `deploy/k8s/open-webui.yaml`'s `patch_subpath.py` rewrites it at start-up and then verifies the result: if a new Open WebUI build no longer matches, the container refuses to start (visible in Argo CD) instead of serving a `/chat` that loads nothing. The image is pinned by digest for that reason.
@@ -270,6 +273,25 @@ kubectl -n rag get secret rag-secrets -o jsonpath='{.data.QDRANT_READ_ONLY_API_K
 Paste it in the UI (key icon, top right). The full `QDRANT_API_KEY` works too, but then the UI can delete collections.
 
 How `/qdrant` works: the `qdrant` VirtualService in `deploy/k8s/istio-routing.yaml` strips the prefix and sets `Cache-Control: no-store` on everything except the UI's hashed files, so Cloudflare never keeps an API answer; the `qdrant-ingress` AuthorizationPolicy lets the gateway reach port 6333 only. This Qdrant build's UI loads its files from `/dashboard/...` and its API client ignores the path of its URL, so start-up copies the UI and patches it for `/qdrant` (`args` in `deploy/argocd/qdrant-values.yaml`). After a chart upgrade, check Qdrant's log for `dashboard-ui: Web UI patched for /qdrant/dashboard`; a `WARNING` there means only the UI under `/qdrant` broke, and the patch needs updating.
+
+## Browsing docling-serve
+
+docling-serve's own Web UI is at **https://jithendar.com/docling** (redirects to `/docling/ui/`). Drop a file or give a URL, pick the output formats and options, press Convert, then read or download the result (Markdown, HTML, JSON, the `.dclx` archive, or open it in the viewer). It is the same service rag-api sends files to, so it shows what `POST /ingest` gets back for a PDF or DOCX. The API reference is at `/docling/docs` (ReDoc) and `/docling/swagger`.
+
+docling-serve has no API key here, so the **gateway asks for a login** before anything under `/docling` (edge chart `basicAuth` entry `docling`). Create that login once, from `k8s-deployments`:
+
+```bash
+kubectl -n rag create secret generic docling-ui-auth --type=kubernetes.io/basic-auth \
+  --from-literal=username=docling --from-literal=password="$(openssl rand -hex 20)"
+kubectl -n rag get secret docling-ui-auth -o jsonpath='{.data.password}' | base64 -d | pbcopy
+python3 scripts/istio/gateway-basic-auth.py   # rebuilds istio-ingress/gateway-basic-auth, then terraform apply
+```
+
+Until that Secret exists, the gateway keeps `/docling` locked (Terraform refuses to plan without the line), never open. Rerun the script and the apply after changing the password.
+
+Mind what the UI can do: a conversion takes up to the pod's 2 CPUs and 4Gi, so a large PDF slows rag-api's file ingests while it runs; and **URL** sources are fetched from inside the cluster.
+
+How `/docling` works: the `docling-serve` VirtualService in `deploy/k8s/istio-routing.yaml` strips the prefix and sets `Cache-Control: no-store` on everything except the UI's hashed files, so Cloudflare never keeps a converted document; the `docling-serve-ingress` AuthorizationPolicy lets the gateway reach port 5001 only. The UI takes its API address from its own URL (everything before `/ui`), including the status WebSocket, so it needs no patch. `UVICORN_ROOT_PATH=/docling` only fixes the links FastAPI writes (the API docs, the `/ui` redirect); requests still arrive without the prefix, so rag-api's calls are unchanged. CORS is limited to `https://jithendar.com`.
 
 ---
 

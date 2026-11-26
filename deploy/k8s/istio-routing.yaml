@@ -5,6 +5,9 @@
 #     - {name: rag, prefix: /rag, to: rag/rag-api}
 #     - {name: chat, prefix: /chat, to: rag/open-webui}
 #     - {name: qdrant, prefix: /qdrant, to: rag/qdrant}
+#     - {name: docling, prefix: /docling, to: rag/docling-serve}
+#   and under `basicAuth` (the gateway's login, required before /docling is delegated):
+#     - {name: docling, prefix: /docling, from: rag/docling-ui-auth}
 #
 # Open WebUI under `/chat`: its prebuilt SvelteKit bundle assumes `/`; open-webui.yaml's patch_subpath.py
 # rewrites it at start-up (and refuses to start if a new build no longer matches).
@@ -12,8 +15,10 @@
 # Qdrant under `/qdrant`: its Web UI and the REST API that UI calls, behind Qdrant's own API key. The UI build is
 # patched for the prefix at start-up (deploy/argocd/qdrant-values.yaml, args). gRPC (6334) stays internal.
 #
-# Strictly internal services (`bge-m3`, `docling-serve`, `litellm`) have NO VirtualService
-# and are exposed via ClusterIP only.
+# docling-serve under `/docling`: its Web UI and the API that UI calls, behind the gateway's login (docling-serve has
+# no API key of its own here). The UI needs no patch: it takes its API address from its own URL.
+#
+# Strictly internal services (`bge-m3`, `litellm`) have NO VirtualService and are exposed via ClusterIP only.
 ---
 # Delegate VirtualService for https://jithendar.com/rag -> rag-api:8000
 # Owned via delegation from `istio-ingress/jithendar-com` (hence no hosts/gateways fields).
@@ -130,6 +135,71 @@ spec:
             port:
               number: 6333
 ---
+# Delegate VirtualService for https://jithendar.com/docling -> docling-serve:5001: the Web UI at /docling/ui/, the API
+# it calls (including the status WebSocket /docling/v1/status/ws/<task>) and the API docs (/docling/docs, /swagger).
+# The gateway asks for the login before any of this (edge chart basicAuth "docling"); without the login every path is
+# 401. Owned via delegation from `istio-ingress/jithendar-com`.
+#
+# Cloudflare caches by URL alone and ignores the Authorization header, so a converted document (/v1/result/<task>)
+# kept there would be served to anyone asking for that URL without the login. `no-store` goes on everything except
+# the UI's scripts and styles, whose file names carry a hash of their content (docling-serve marks those immutable).
+# `no-transform` everywhere keeps Cloudflare from rewriting the page or its scripts. No timeout: uploads and the
+# status WebSocket can take as long as a conversion does.
+#
+# /docling and /docling/ui are redirected here: docling-serve would send /ui to an http:// address (it cannot tell the
+# request came in over HTTPS).
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: docling-serve
+  namespace: rag
+  labels:
+    app: docling-serve
+    app.kubernetes.io/part-of: rag
+spec:
+  http:
+    - name: docling-ui-redirect
+      match:
+        - uri:
+            exact: /docling
+        - uri:
+            exact: /docling/
+        - uri:
+            exact: /docling/ui
+      redirect:
+        uri: /docling/ui/
+        redirectCode: 308
+    - name: docling-ui-assets
+      match:
+        - uri:
+            prefix: /docling/ui/assets/
+      rewrite:
+        uri: /ui/assets/
+      headers:
+        response:
+          add:
+            cache-control: no-transform
+      route:
+        - destination:
+            host: docling-serve.rag.svc.cluster.local
+            port:
+              number: 5001
+    - name: docling-prefix
+      match:
+        - uri:
+            prefix: /docling/
+      rewrite:
+        uri: /
+      headers:
+        response:
+          set:
+            cache-control: no-store, no-transform
+      route:
+        - destination:
+            host: docling-serve.rag.svc.cluster.local
+            port:
+              number: 5001
+---
 # Enforce STRICT mTLS across all meshed pods in the `rag` namespace.
 apiVersion: security.istio.io/v1
 kind: PeerAuthentication
@@ -245,6 +315,29 @@ spec:
       to:
         - operation:
             ports: ["6333"]
+---
+# Allow the Istio ingress gateway to reach docling-serve for https://jithendar.com/docling (VirtualService
+# docling-serve). The gateway has already checked the login.
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: docling-serve-ingress
+  namespace: rag
+  labels:
+    app: docling-serve
+    app.kubernetes.io/part-of: rag
+spec:
+  selector:
+    matchLabels:
+      app: docling-serve
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            namespaces: ["istio-ingress"]
+      to:
+        - operation:
+            ports: ["5001"]
 ---
 # Allow Prometheus (monitoring namespace) to scrape Istio sidecar metrics.
 apiVersion: security.istio.io/v1
