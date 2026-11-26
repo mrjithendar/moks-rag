@@ -4,7 +4,7 @@ Production, CPU-only Hybrid RAG platform deployed in the `rag` namespace on Hetz
 
 ## Architecture
 
-All components run in the `rag` namespace and communicate over internal Kubernetes DNS (`*.rag.svc.cluster.local`). Only `rag-api` (`https://jithendar.com/rag`) and `open-webui` (`https://chat.jithendar.com`) are exposed through the Istio ingress gateway (`istio-ingress/public`); every backend service is strictly `ClusterIP`-only.
+All components run in the `rag` namespace and communicate over internal Kubernetes DNS (`*.rag.svc.cluster.local`). Only `rag-api` (`https://jithendar.com/rag`) and `open-webui` (`https://jithendar.com/chat`) are exposed through the Istio ingress gateway (`istio-ingress/public`); every backend service is strictly `ClusterIP`-only.
 
 | Component | Image / Chart | Internal Endpoint | Purpose |
 | --- | --- | --- | --- |
@@ -48,12 +48,14 @@ moks-rag/
 │   │   ├── rag-secrets.sealed-secret.yaml.template
 │   │   └── rag-secrets.external-secret.yaml.template
 │   └── argocd/                          # ArgoCD AppProject + Applications + Qdrant Helm values
+│       ├── ci-rbac.yaml
 │       ├── project.yaml
 │       ├── rag-stack-app.yaml
 │       ├── qdrant-app.yaml
 │       └── qdrant-values.yaml
 └── .github/workflows/
-    └── build-and-deploy.yaml            # Lint/test -> multi-arch GHCR push -> Kustomize tag bump
+    ├── build-and-deploy.yaml            # Lint/test -> multi-arch GHCR push -> Kustomize tag bump
+    └── deploy-argocd-apps.yaml          # Validate & apply ArgoCD AppProject/Applications to k3s
 ```
 
 ---
@@ -94,25 +96,42 @@ kubectl -n rag create secret generic rag-secrets \
 
 - Use `deploy/k8s/rag-secrets.sealed-secret.yaml.template` with `kubeseal`, or `deploy/k8s/rag-secrets.external-secret.yaml.template` with Vault ESO, then add the generated file to `deploy/k8s/kustomization.yaml`.
 
-### 2. Wire `jithendar.com/rag` and `chat.jithendar.com` in the Edge Gateway
+### 2. Wire `jithendar.com/rag` and `jithendar.com/chat` in the Edge Gateway
 
-In your cluster edge chart (`k8s-deployments/deploy/minikube/istio/edge/values.yaml`), add two lines so the shared `istio-ingress/public` Gateway and root VirtualService bind `chat.jithendar.com` and delegate `/rag`:
+In your cluster edge chart (`k8s-deployments/deploy/minikube/istio/edge/values.yaml`), add two delegates under `root.delegates` so the shared `istio-ingress/jithendar-com` root VirtualService delegates `/rag` and `/chat`:
 
 ```yaml
-gateway:
-  https:
-    - istio-ingress/jithendar.com
-    - istio-ingress/www.jithendar.com
-    - rag/chat.jithendar.com        # <-- add
-
 root:
   delegates:
-    - {name: rag, prefix: /rag, to: rag/rag-api}   # <-- add
+    - {name: rag, prefix: /rag, to: rag/rag-api}     # <-- add
+    - {name: chat, prefix: /chat, to: rag/open-webui} # <-- add
 ```
 
-Ensure DNS has an `A`/`CNAME` record for `chat.jithendar.com` pointing to the Hetzner ingress IP (covered automatically by the existing `*.jithendar.com` wildcard cert).
+> **Open WebUI subpath note:** Upstream `ghcr.io/open-webui/open-webui:main` builds its SvelteKit frontend with `base: ""` (root-absolute `/_app/...`, `/static/...`, `/api/...`, `/ws/socket.io/...`). If assets 404 under `/chat/`, either build Open WebUI with SvelteKit `paths.base = "/chat"` or configure a `302` redirect in `istio-edge` from `/chat` to `chat.jithendar.com` (the same pattern used for Harbor's `/harbor` -> `registry.jithendar.com`).
 
-### 3. Apply ArgoCD `AppProject` and `Application`s
+### 3. Apply ArgoCD `AppProject` and `Application`s (Manual or via GitHub Actions)
+
+**Option A — Automated via `.github/workflows/deploy-argocd-apps.yaml`:**
+
+Configure GitHub Actions authentication using either a least-privilege ServiceAccount token (recommended) or a base64 kubeconfig:
+
+```bash
+# Option A1: Scoped ServiceAccount in argocd namespace (recommended)
+kubectl apply -f deploy/argocd/ci-rbac.yaml
+kubectl -n argocd get secret github-rag-argocd-deployer-token \
+  -o jsonpath='{.data.token}' | base64 -d | gh secret set K8S_ARGOCD_TOKEN -R mrjithendar/moks-rag
+gh variable set K8S_API_SERVER -R mrjithendar/moks-rag \
+  --body "$(kubectl config view --raw --minify -o jsonpath='{.clusters[0].cluster.server}')"
+gh variable set K8S_CA_DATA -R mrjithendar/moks-rag \
+  --body "$(kubectl config view --raw --minify -o jsonpath='{.clusters[0].cluster.certificate-authority-data}')"
+
+# Option A2: Full kubeconfig secret
+base64 -i kubeconfig-hetzner | tr -d '\n' | gh secret set KUBECONFIG_B64 -R mrjithendar/moks-rag
+```
+
+Pushing changes under `deploy/argocd/**` to `main` (or triggering `Deploy ArgoCD Applications` via `workflow_dispatch`) validates and applies `project.yaml`, `qdrant-app.yaml`, and `rag-stack-app.yaml`, refreshes ArgoCD, and checks `Synced`/`Healthy` status.
+
+**Option B — Manual `kubectl apply`:**
 
 ```bash
 kubectl apply -f deploy/argocd/project.yaml
@@ -209,10 +228,10 @@ curl -fsS -X DELETE "https://jithendar.com/rag/documents/smoke-doc-1?collection=
 **Verify Open WebUI:**
 
 ```bash
-curl -fsSI https://chat.jithendar.com/health
+curl -fsSI https://jithendar.com/chat/health
 ```
 
-Open `https://chat.jithendar.com` in your browser, sign in (the first registered admin account is created on initial setup; `ENABLE_SIGNUP=false` prevents further public signups), and select **`moks-sre`**, **`moks-cms`**, or **`moks-seo-agent`** from the model selector.
+Open `https://jithendar.com/chat/` in your browser, sign in (the first registered admin account is created on initial setup; `ENABLE_SIGNUP=false` prevents further public signups), and select **`moks-sre`**, **`moks-cms`**, or **`moks-seo-agent`** from the model selector.
 
 ---
 

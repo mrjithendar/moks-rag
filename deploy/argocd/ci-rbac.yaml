@@ -1,0 +1,53 @@
+# Least-privilege RBAC for `.github/workflows/deploy-argocd-apps.yaml` when authenticating via a
+# scoped ServiceAccount token instead of a full cluster-admin kubeconfig.
+#
+# One-time setup:
+#   kubectl apply -f deploy/argocd/ci-rbac.yaml
+#   kubectl -n argocd get secret github-rag-argocd-deployer-token \
+#     -o jsonpath='{.data.token}' | base64 -d | gh secret set K8S_ARGOCD_TOKEN -R mrjithendar/moks-rag
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: github-rag-argocd-deployer
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: rag
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: github-rag-argocd-deployer-token
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: rag
+  annotations:
+    kubernetes.io/service-account.name: github-rag-argocd-deployer
+type: kubernetes.io/service-account-token
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: github-rag-argocd-deployer
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: rag
+rules:
+  - apiGroups: ["argoproj.io"]
+    resources: ["appprojects", "applications"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: github-rag-argocd-deployer
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: rag
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: github-rag-argocd-deployer
+subjects:
+  - kind: ServiceAccount
+    name: github-rag-argocd-deployer
+    namespace: argocd
