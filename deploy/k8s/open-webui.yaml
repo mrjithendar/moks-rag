@@ -8,7 +8,114 @@ metadata:
     app.kubernetes.io/part-of: rag
 automountServiceAccountToken: false
 ---
-# Uses `local-path` because Hetzner CSI (`hcloud-volumes`) enforces a 5–10Gi minimum volume size.
+# Patches Open WebUI's prebuilt SvelteKit frontend at container startup so it runs natively
+# under a subpath (`/chat`) on `https://jithendar.com/chat/` without rebuilding the upstream image.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: open-webui-subpath-patch
+  namespace: rag
+  labels:
+    app: open-webui
+    app.kubernetes.io/part-of: rag
+data:
+  patch_subpath.py: |
+    #!/usr/bin/env python3
+    """Idempotently patch Open WebUI's SvelteKit build to serve cleanly under a subpath."""
+    import pathlib
+    import re
+    import sys
+
+    prefix = (sys.argv[1] if len(sys.argv) > 1 else "/chat").rstrip("/")
+    if not prefix.startswith("/"):
+        prefix = "/" + prefix
+
+    build_dir = pathlib.Path("/app/build")
+    index_path = build_dir / "index.html"
+    marker = "/* moks-subpath-shim */"
+
+    shim = (
+        f"<script>{marker}(function(){{"
+        f'var P="{prefix}";'
+        r'var R=/^\/(api|ollama|openai|static|_app|ws|assets|audio|images|videos|cache|pyodide|manifest\.json|opensearch\.xml|favicon)(\/|$|\?)/;'
+        r'function rw(u){if(typeof u!=="string")return u;'
+        r'if(u.indexOf(P+"/")===0||u===P)return u;'
+        r'if(R.test(u))return P+u;'
+        r'if(/^wss?:\/\/[^/]+\/ws\//.test(u))return u.replace(/^(wss?:\/\/[^/]+)(\/ws\/)/,"$1"+P+"$2");'
+        r'if(u.indexOf(location.origin+"/")===0&&R.test(u.slice(location.origin.length)))return location.origin+P+u.slice(location.origin.length);'
+        r'return u;}'
+        r'function rwPath(u){if(typeof u!=="string")return u;'
+        r'if(u.indexOf(P+"/")===0||u===P)return u;'
+        r'if(u.charAt(0)==="/"&&u.charAt(1)!=="/")return P+u;'
+        r'return u;}'
+        r'var F=window.fetch;window.fetch=function(i,n){'
+        r'if(typeof i==="string")i=rw(i);'
+        r'else if(i instanceof Request){var nu=rw(i.url);if(nu!==i.url)i=new Request(nu,i);}'
+        r'return F.call(this,i,n);};'
+        r'var O=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(m,u){'
+        r'var a=Array.prototype.slice.call(arguments);a[1]=rw(u);return O.apply(this,a);};'
+        r'var W=window.WebSocket;function WrappedWS(u,p){return p!==undefined?new W(rw(u),p):new W(rw(u));}'
+        r'WrappedWS.prototype=W.prototype;WrappedWS.CONNECTING=W.CONNECTING;WrappedWS.OPEN=W.OPEN;'
+        r'WrappedWS.CLOSING=W.CLOSING;WrappedWS.CLOSED=W.CLOSED;window.WebSocket=WrappedWS;'
+        r'if(window.EventSource){var E=window.EventSource;function WrappedES(u,c){return new E(rw(u),c);}'
+        r'WrappedES.prototype=E.prototype;window.EventSource=WrappedES;}'
+        r'var SA=Element.prototype.setAttribute;Element.prototype.setAttribute=function(k,v){'
+        r'if(typeof v==="string"){if(k==="src")v=rw(v);else if(k==="href")v=this.tagName==="A"?rwPath(v):rw(v);}'
+        r'return SA.call(this,k,v);};'
+        r'var ID=Object.getOwnPropertyDescriptor(HTMLImageElement.prototype,"src");'
+        r'if(ID&&ID.set){Object.defineProperty(HTMLImageElement.prototype,"src",{'
+        r'get:ID.get,set:function(v){ID.set.call(this,rw(v));},configurable:true});}'
+        r'document.addEventListener("click",function(ev){'
+        r'var a=ev.target&&ev.target.closest?ev.target.closest("a[href]"):null;'
+        r'if(!a)return;var h=a.getAttribute("href");'
+        r'if(h&&h.charAt(0)==="/"&&h.charAt(1)!=="/"&&h.indexOf(P+"/")!==0&&h!==P){'
+        r'SA.call(a,"href",P+h);}},true);'
+        r"})();</script>"
+    )
+
+    if index_path.exists():
+        html = index_path.read_text(encoding="utf-8")
+        if marker not in html:
+            html = html.replace('href="/', f'href="{prefix}/')
+            html = html.replace('src="/', f'src="{prefix}/')
+            html = html.replace('import("/_app/', f'import("{prefix}/_app/')
+            html = html.replace('base: ""', f'base: "{prefix}"')
+            html = html.replace("<head>", "<head>\n\t\t" + shim, 1)
+            index_path.write_text(html, encoding="utf-8")
+            print(f"[subpath-patch] patched {index_path} for {prefix}")
+
+    # Patch SvelteKit client URL resolver (ne) so goto('/auth') etc. stay under /chat,
+    # and patch Socket.IO path '/ws/socket.io' -> '/chat/ws/socket.io'.
+    ne_re = re.compile(
+        r"if\(([a-zA-Z_$][\w$]*) instanceof URL\)return \1;let ([a-zA-Z_$][\w$]*)=document\.baseURI;"
+    )
+    patched_ne = 0
+    patched_ws = 0
+    immutable = build_dir / "_app" / "immutable"
+    if immutable.exists():
+        for js in immutable.rglob("*.js"):
+            txt = js.read_text(encoding="utf-8", errors="ignore")
+            orig = txt
+            if f'"{prefix}/ws/socket.io"' not in txt and '"/ws/socket.io"' in txt:
+                txt = txt.replace('"/ws/socket.io"', f'"{prefix}/ws/socket.io"')
+                patched_ws += 1
+            if f'"{prefix}/"' not in txt and ne_re.search(txt):
+                def _repl(m: re.Match[str]) -> str:
+                    arg, base_var = m.group(1), m.group(2)
+                    guard = (
+                        f'if(typeof {arg}==="string"&&{arg}.startsWith("/")&&!{arg}.startsWith("//")'
+                        f'&&!{arg}.startsWith("{prefix}/")&&{arg}!=="{prefix}"){arg}="{prefix}"+{arg};'
+                    )
+                    return f"{guard}if({arg} instanceof URL)return {arg};let {base_var}=document.baseURI;"
+
+                txt = ne_re.sub(_repl, txt, count=1)
+                patched_ne += 1
+            if txt != orig:
+                js.write_text(txt, encoding="utf-8")
+
+    print(f"[subpath-patch] done: prefix={prefix}, patched_ne={patched_ne}, patched_ws={patched_ws}")
+---
+# Uses `local-path` because Hetzner CSI (`hcloud-volumes`) enforces a 10Gi minimum volume size.
 # Switch to `hcloud-volumes` (and bump to 10Gi) if you prefer node-portable persistence.
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -54,6 +161,9 @@ spec:
         - name: open-webui
           image: ghcr.io/open-webui/open-webui:main
           imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - python3 /patches/patch_subpath.py /chat && exec bash /app/backend/start.sh
           env:
             - name: OPENAI_API_BASE_URL
               value: "http://rag-api.rag.svc.cluster.local:8000/v1"
@@ -112,10 +222,16 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /app/backend/data
+            - name: subpath-patch
+              mountPath: /patches
+              readOnly: true
       volumes:
         - name: data
           persistentVolumeClaim:
             claimName: open-webui-data
+        - name: subpath-patch
+          configMap:
+            name: open-webui-subpath-patch
 ---
 apiVersion: v1
 kind: Service
