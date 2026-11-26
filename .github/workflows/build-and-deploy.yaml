@@ -48,6 +48,31 @@ jobs:
       - name: Run pytest
         run: pytest -v
 
+  # Pull requests: build the image (one platform, nothing pushed) so a broken Dockerfile or a model download
+  # whose sha256 no longer matches fails before merge instead of after it.
+  image-check:
+    name: Build Container Image (PR check)
+    needs: test
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image without pushing
+        uses: docker/build-push-action@v6
+        with:
+          context: ./app
+          file: ./app/Dockerfile
+          platforms: linux/amd64
+          push: false
+          cache-from: type=gha
+
   build-and-push:
     name: Build and Push Container Image
     needs: test
