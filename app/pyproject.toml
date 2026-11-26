@@ -36,6 +36,9 @@ src = ["src", "tests"]
 select = ["E", "F", "I", "UP", "B", "SIM"]
 ignore = ["B008"]
 
+[tool.ruff.lint.isort]
+known-first-party = ["rag_api", "tests"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]

@@ -7,10 +7,10 @@ import logging
 from typing import Any
 
 from fastapi.testclient import TestClient
-from tests.conftest import TEST_TOKEN
 
 from rag_api.chunking import chunk_text
 from rag_api.sparse import encode_sparse_bm25
+from tests.conftest import TEST_TOKEN
 
 AUTH_HEADERS = {
     "Authorization": f"Bearer {TEST_TOKEN}",
