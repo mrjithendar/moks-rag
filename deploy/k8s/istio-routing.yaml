@@ -1,0 +1,166 @@
+# Istio routing and zero-trust mesh policies for the `rag` namespace on Hetzner k3s.
+#
+# Cluster Edge Gateway integration (k8s-deployments/deploy/minikube/istio/edge/values.yaml):
+#   1. Under `gateway.https`, add:
+#        - rag/chat.jithendar.com
+#   2. Under `root.delegates`, add:
+#        - {name: rag, prefix: /rag, to: rag/rag-api}
+#
+# Strictly internal services (`bge-m3`, `qdrant`, `docling-serve`, `litellm`) have NO VirtualService
+# and are exposed via ClusterIP only.
+---
+# Delegate VirtualService for https://jithendar.com/rag -> rag-api:8000
+# Owned via delegation from `istio-ingress/jithendar-com` (hence no hosts/gateways fields).
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: rag-api
+  namespace: rag
+  labels:
+    app: rag-api
+    app.kubernetes.io/part-of: rag
+spec:
+  http:
+    - name: rag-api-prefix
+      match:
+        - uri:
+            prefix: /rag/
+        - uri:
+            exact: /rag
+      rewrite:
+        uri: /
+      route:
+        - destination:
+            host: rag-api.rag.svc.cluster.local
+            port:
+              number: 8000
+---
+# Standalone VirtualService for https://chat.jithendar.com -> open-webui:80
+# Attaches directly to the existing cluster gateway (`istio-ingress/public`, wildcard cert *.jithendar.com).
+# No timeout field so SSE chat streaming and WebSockets are not truncated.
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: open-webui
+  namespace: rag
+  labels:
+    app: open-webui
+    app.kubernetes.io/part-of: rag
+spec:
+  hosts:
+    - chat.jithendar.com
+  gateways:
+    - istio-ingress/public
+  http:
+    - name: open-webui
+      match:
+        - uri:
+            prefix: /
+      route:
+        - destination:
+            host: open-webui.rag.svc.cluster.local
+            port:
+              number: 80
+---
+# Enforce STRICT mTLS across all meshed pods in the `rag` namespace.
+apiVersion: security.istio.io/v1
+kind: PeerAuthentication
+metadata:
+  name: default
+  namespace: rag
+  labels:
+    app.kubernetes.io/part-of: rag
+spec:
+  mtls:
+    mode: STRICT
+---
+# Default-deny all inbound mesh requests in `rag` unless explicitly permitted below.
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: allow-nothing
+  namespace: rag
+  labels:
+    app.kubernetes.io/part-of: rag
+spec: {}
+---
+# Allow internal `rag` namespace pods (rag-api, open-webui) to call internal RAG services
+# (qdrant, docling-serve, litellm, rag-api). `bge-m3` has its own dedicated AuthorizationPolicy.
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: rag-internal-services
+  namespace: rag
+  labels:
+    app.kubernetes.io/part-of: rag
+spec:
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            namespaces: ["rag"]
+      to:
+        - operation:
+            ports: ["6333", "6334", "5001", "4000", "8000"]
+---
+# Allow Istio ingress gateway and internal consumer namespaces (moks-sre, jithendar) to reach rag-api.
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: rag-api-callers
+  namespace: rag
+  labels:
+    app: rag-api
+    app.kubernetes.io/part-of: rag
+spec:
+  selector:
+    matchLabels:
+      app: rag-api
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            namespaces: ["istio-ingress", "rag", "moks-sre", "jithendar"]
+      to:
+        - operation:
+            ports: ["8000"]
+---
+# Allow Istio ingress gateway to reach open-webui.
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: open-webui-ingress
+  namespace: rag
+  labels:
+    app: open-webui
+    app.kubernetes.io/part-of: rag
+spec:
+  selector:
+    matchLabels:
+      app: open-webui
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            namespaces: ["istio-ingress"]
+      to:
+        - operation:
+            ports: ["8080"]
+---
+# Allow Prometheus (monitoring namespace) to scrape Istio sidecar metrics.
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: monitoring-scrape
+  namespace: rag
+  labels:
+    app.kubernetes.io/part-of: rag
+spec:
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            namespaces: ["monitoring"]
+      to:
+        - operation:
+            ports: ["15020", "15090"]

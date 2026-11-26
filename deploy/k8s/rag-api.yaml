@@ -1,0 +1,141 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rag-api
+  namespace: rag
+  labels:
+    app: rag-api
+    app.kubernetes.io/part-of: rag
+automountServiceAccountToken: false
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rag-api
+  namespace: rag
+  labels:
+    app: rag-api
+    app.kubernetes.io/part-of: rag
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rag-api
+  template:
+    metadata:
+      labels:
+        app: rag-api
+        app.kubernetes.io/part-of: rag
+    spec:
+      serviceAccountName: rag-api
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: rag-api
+          image: ghcr.io/mrjithendar/moks-rag-api:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: ROOT_PATH
+              value: "/rag"
+            - name: LOG_LEVEL
+              value: "INFO"
+            - name: QDRANT_URL
+              value: "http://qdrant.rag.svc.cluster.local:6333"
+            - name: BGE_M3_URL
+              value: "http://bge-m3.rag.svc.cluster.local:8001"
+            - name: BGE_M3_MODEL
+              value: "bge-m3:567m"
+            - name: BGE_M3_API_STYLE
+              value: "openai"
+            - name: SPARSE_MODE
+              value: "bm25"
+            - name: DOCLING_URL
+              value: "http://docling-serve.rag.svc.cluster.local:5001"
+            - name: LITELLM_URL
+              value: "http://litellm.rag.svc.cluster.local:4000/v1"
+            - name: DEFAULT_LLM_MODEL
+              value: "claude-sonnet-5-5"
+            - name: FAST_LLM_MODEL
+              value: "claude-haiku-5-5"
+            - name: RAG_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: rag-secrets
+                  key: RAG_BEARER_TOKEN
+            - name: QDRANT_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: rag-secrets
+                  key: QDRANT_API_KEY
+            - name: LITELLM_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: rag-secrets
+                  key: LITELLM_MASTER_KEY
+          ports:
+            - name: http
+              containerPort: 8000
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 18
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 150m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 768Mi
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rag-api
+  namespace: rag
+  labels:
+    app: rag-api
+    app.kubernetes.io/part-of: rag
+spec:
+  type: ClusterIP
+  selector:
+    app: rag-api
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+      appProtocol: http

@@ -1,0 +1,50 @@
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: moks-rag
+  namespace: argocd
+spec:
+  description: Hybrid RAG platform (bge-m3, qdrant, docling-serve, litellm, rag-api, open-webui)
+  sourceRepos:
+    - https://github.com/mrjithendar/moks-rag.git
+    - https://qdrant.github.io/qdrant-helm
+  destinations:
+    - server: https://kubernetes.default.svc
+      namespace: rag
+  clusterResourceWhitelist:
+    - group: ""
+      kind: Namespace
+  namespaceResourceWhitelist:
+    - group: ""
+      kind: ConfigMap
+    - group: ""
+      kind: PersistentVolumeClaim
+    - group: ""
+      kind: Pod
+    - group: ""
+      kind: Service
+    - group: ""
+      kind: ServiceAccount
+    - group: apps
+      kind: Deployment
+    - group: apps
+      kind: ReplicaSet
+    - group: apps
+      kind: StatefulSet
+    - group: networking.k8s.io
+      kind: NetworkPolicy
+    - group: policy
+      kind: PodDisruptionBudget
+    - group: networking.istio.io
+      kind: VirtualService
+    - group: networking.istio.io
+      kind: Gateway
+    - group: security.istio.io
+      kind: PeerAuthentication
+    - group: security.istio.io
+      kind: AuthorizationPolicy
+    - group: bitnami.com
+      kind: SealedSecret
+    - group: external-secrets.io
+      kind: ExternalSecret
+  # Raw Secrets are intentionally omitted so ArgoCD neither stores nor prunes out-of-band Secrets.
