@@ -19,4 +19,4 @@ resources:
 images:
   - name: ghcr.io/mrjithendar/moks-rag-api
     newName: ghcr.io/mrjithendar/moks-rag-api
-    newTag: 31758a03e6f08d8efdcbc81f2396c0159c3a267e
+    newTag: acf44e2891cd8e293923b01de4c3a40b469559f1
