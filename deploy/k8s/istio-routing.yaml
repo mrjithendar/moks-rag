@@ -4,11 +4,15 @@
 #   Under `root.delegates`, add:
 #     - {name: rag, prefix: /rag, to: rag/rag-api}
 #     - {name: chat, prefix: /chat, to: rag/open-webui}
+#     - {name: qdrant, prefix: /qdrant, to: rag/qdrant}
 #
 # Open WebUI under `/chat`: its prebuilt SvelteKit bundle assumes `/`; open-webui.yaml's patch_subpath.py
 # rewrites it at start-up (and refuses to start if a new build no longer matches).
 #
-# Strictly internal services (`bge-m3`, `qdrant`, `docling-serve`, `litellm`) have NO VirtualService
+# Qdrant under `/qdrant`: its Web UI and the REST API that UI calls, behind Qdrant's own API key. The UI build is
+# patched for the prefix at start-up (deploy/argocd/qdrant-values.yaml, args). gRPC (6334) stays internal.
+#
+# Strictly internal services (`bge-m3`, `docling-serve`, `litellm`) have NO VirtualService
 # and are exposed via ClusterIP only.
 ---
 # Delegate VirtualService for https://jithendar.com/rag -> rag-api:8000
@@ -68,6 +72,63 @@ spec:
             host: open-webui.rag.svc.cluster.local
             port:
               number: 80
+---
+# Delegate VirtualService for https://jithendar.com/qdrant -> qdrant:6333: the Web UI at /qdrant/dashboard and the REST
+# API it calls under /qdrant/. Without the API key only the version (/qdrant/), /qdrant/livez, /qdrant/readyz and the
+# UI's own files answer; everything else is 401. Owned via delegation from `istio-ingress/jithendar-com`.
+#
+# Cloudflare caches by URL alone (the api-key header is ignored) and keeps what it caches for an hour, so the answer to
+# one keyed GET (collections, a point and its payload) would be served to anyone asking for that URL. Qdrant sends no
+# Cache-Control, so `no-store` is set on everything except the UI's scripts, styles and fonts, whose file names carry a
+# hash of their content. `no-transform` everywhere keeps Cloudflare from rewriting the page or its scripts (Rocket
+# Loader left Argo CD's UI blank).
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: qdrant
+  namespace: rag
+  labels:
+    app: qdrant
+    app.kubernetes.io/part-of: rag
+spec:
+  http:
+    - name: qdrant-exact
+      match:
+        - uri:
+            exact: /qdrant
+      redirect:
+        uri: /qdrant/dashboard
+        redirectCode: 308
+    - name: qdrant-dashboard-assets
+      match:
+        - uri:
+            prefix: /qdrant/dashboard/assets/
+      rewrite:
+        uri: /dashboard/assets/
+      headers:
+        response:
+          add:
+            cache-control: no-transform
+      route:
+        - destination:
+            host: qdrant.rag.svc.cluster.local
+            port:
+              number: 6333
+    - name: qdrant-prefix
+      match:
+        - uri:
+            prefix: /qdrant/
+      rewrite:
+        uri: /
+      headers:
+        response:
+          set:
+            cache-control: no-store, no-transform
+      route:
+        - destination:
+            host: qdrant.rag.svc.cluster.local
+            port:
+              number: 6333
 ---
 # Enforce STRICT mTLS across all meshed pods in the `rag` namespace.
 apiVersion: security.istio.io/v1
@@ -161,6 +222,29 @@ spec:
       to:
         - operation:
             ports: ["8080"]
+---
+# Allow the Istio ingress gateway to reach Qdrant's REST port for https://jithendar.com/qdrant (VirtualService qdrant).
+# Qdrant's API key still decides what each request may do; gRPC (6334) and the p2p port stay internal.
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: qdrant-ingress
+  namespace: rag
+  labels:
+    app: qdrant
+    app.kubernetes.io/part-of: rag
+spec:
+  selector:
+    matchLabels:
+      app: qdrant
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            namespaces: ["istio-ingress"]
+      to:
+        - operation:
+            ports: ["6333"]
 ---
 # Allow Prometheus (monitoring namespace) to scrape Istio sidecar metrics.
 apiVersion: security.istio.io/v1
