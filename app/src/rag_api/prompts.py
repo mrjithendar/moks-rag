@@ -34,7 +34,11 @@ CONDENSE_PROMPT = (
     "exactly as written. Answer with the query only, no quotes, no explanation."
 )
 
-_TAG = re.compile(r"<(/?)\s*(documents?|question)\b", re.IGNORECASE)
+_INVISIBLE = "\u200b\u200c\u200d\u2060\ufeff"
+_TAG = re.compile(
+    rf"<[\s{_INVISIBLE}]*(/?)[\s{_INVISIBLE}]*(documents?|question|conversation|last_message)\b",
+    re.IGNORECASE,
+)
 
 
 def _neutralize(text: str) -> str:

@@ -259,7 +259,7 @@ Open `https://jithendar.com/chat/` in your browser, sign in (the first registere
 | --- | --- | --- |
 | `POST /ingest` | write on `collection` | JSON or multipart (`file` via docling-serve). **`doc_id` is required**: sending the same `doc_id` again replaces the document. The answer has `unchanged: true` when the stored version was identical (nothing embedded or written). A chunk too long for bge-m3's context is refused with 422 instead of being embedded from its start only. |
 | `DELETE /documents/{doc_id}?collection=…` | write | **`collection` is required** (`all` = every collection the caller may write). `doc_id` may contain `/`. Also `DELETE /documents?doc_id=…&collection=…`. |
-| `POST /query` | read | Each source has `score` (rank fusion: orders one answer only), **`dense_score`** (cosine similarity, comparable across queries) and `rerank_score` when the reranker ran. `min_dense_score` drops chunks below a cosine floor. `model` must be `DEFAULT_LLM_MODEL` or `FAST_LLM_MODEL`. |
+| `POST /query` | read | Each source has `score` (rank fusion: orders one answer only), **`dense_score`** (cosine similarity, comparable across queries) and `rerank_score` when the reranker ran. `min_dense_score` drops chunks below a cosine floor. `filters` match payload fields exactly (not `text` or `document*`; the first filter on a field indexes it). `model` must be `DEFAULT_LLM_MODEL` or `FAST_LLM_MODEL`. |
 | `GET /v1/models`, `POST /v1/chat/completions` | read on the model's collection | OpenAI-compatible, for Open WebUI. Follow-ups are rewritten into a standalone search query with `FAST_LLM_MODEL` (`CONDENSE_FOLLOWUPS`). Open WebUI's background tasks (title, tags, follow-ups: messages starting `### Task:`) skip retrieval and use `FAST_LLM_MODEL`. |
 | `GET /admin/collections`, `POST /admin/collections/{name}/rebuild`, `…/promote`, `DELETE /admin/physical/{name}` | admin | [Index versions](#index-versions). |
 
@@ -344,6 +344,10 @@ Run it before and after a retrieval change (chunking, reranker, floor) and compa
 2. Callers need no change: they already send `doc_id` and `collection`, and keep the shared token until step 3.
 3. Issue per-service tokens ([Access](#access-per-service-tokens)), then switch the shared token off.
 4. Merge the Prometheus job `rag-api` (k8s-deployments) so the metrics are scraped.
+
+**Rolling back to 0.1.0** after the aliases exist: 0.1.0 creates real collections named `sre_knowledge` etc. and cannot
+while aliases of those names exist, so first remove the aliases (Qdrant `POST /collections/aliases` with
+`delete_alias` for each), then deploy the old image; 0.1.0 starts with empty collections and the callers re-send.
 
 ---
 

@@ -26,7 +26,7 @@ from rag_api.chunking import chunk_markdown, embedding_text
 from rag_api.config import Settings
 from rag_api.embeddings import EmbeddingClient
 from rag_api.logs import emit
-from rag_api.store import RESERVED_KEYS, PreparedChunk, QdrantStore
+from rag_api.store import RESERVED_KEYS, PreparedChunk, QdrantStore, new_version_ts
 
 logger = logging.getLogger("rag_api.indexer")
 
@@ -111,8 +111,15 @@ class Indexer:
         encoded = json.dumps(material, sort_keys=True, default=str, ensure_ascii=False)
         return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
-    async def ingest(self, doc: IngestDoc, *, targets: list[str] | None = None) -> IngestOutcome:
-        """Index one document into every physical collection it is written to (or `targets`)."""
+    async def ingest(
+        self, doc: IngestDoc, *, targets: list[str] | None = None, ts: int | None = None
+    ) -> IngestOutcome:
+        """Index one document into every physical collection it is written to (or `targets`).
+
+        One version timestamp covers every target (`ts`, or now), so concurrent writes of a doc_id
+        settle on the same winner in each collection. An unchanged target is still pruned of older
+        versions.
+        """
         chunks = chunk_markdown(
             doc.text, chunk_size=doc.chunk_size, chunk_overlap=doc.chunk_overlap
         )
@@ -126,6 +133,8 @@ class Indexer:
             current = await self._store.current_version(physical, doc.doc_id)
             if current is None or current.content_hash != digest:
                 stale.append(physical)
+            else:
+                await self._store.prune_older(physical, doc.doc_id, current.ingest_ts)
         if not stale:
             return IngestOutcome(chunks=len(chunks), unchanged=True)
 
@@ -141,15 +150,15 @@ class Indexer:
             "index_version": self._settings.index_version,
             "embedding_model": self._embeddings.model,
         }
+        version_ts = ts if ts is not None else new_version_ts()
         count = 0
         for physical in stale:
             count = await self._store.replace_document(
-                physical, doc.doc_id, prepared, payload_base, doc.as_stored()
+                physical, doc.doc_id, prepared, payload_base, doc.as_stored(), ts=version_ts
             )
         return IngestOutcome(chunks=count, unchanged=False)
 
     # --- rebuild ---
-    # ----------------------------------------------------------------------------------------------
 
     def rebuild_status(self, logical: str) -> dict[str, Any] | None:
         return self.rebuilds.get(logical)
@@ -193,7 +202,11 @@ class Indexer:
                     )
                     try:
                         async with self.slot():
-                            outcome = await self.ingest(doc, targets=[state.target])
+                            # The source's own timestamp: a live write made meanwhile is newer and
+                            # wins.
+                            outcome = await self.ingest(
+                                doc, targets=[state.target], ts=stored.ingest_ts
+                            )
                         status["unchanged" if outcome.unchanged else "documents"] += 1
                     except Exception as exc:  # noqa: BLE001 - one bad document must not stop the rebuild
                         status["failed"] += 1

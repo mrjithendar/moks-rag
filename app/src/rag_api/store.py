@@ -105,6 +105,11 @@ def _now_us() -> int:
     return time.time_ns() // 1000
 
 
+def new_version_ts() -> int:
+    """The timestamp of a new document version (calls _now_us, so tests can patch that)."""
+    return _now_us()
+
+
 class QdrantStore:
     """Manages isolated Qdrant collections with named dense + sparse vectors and RRF fusion."""
 
@@ -370,11 +375,18 @@ class QdrantStore:
         chunks: list[PreparedChunk],
         payload_base: dict[str, Any],
         document: dict[str, Any],
+        *,
+        ts: int | None = None,
     ) -> int:
-        """Write a new version of a document, then remove the older ones (see module docstring)."""
+        """Write a new version of a document, then remove the older ones (see module docstring).
+
+        `ts` is the version's timestamp: one per ingest (the same in every collection it is written
+        to), or the source's own when a rebuild copies a document, so that any live write is newer
+        and wins.
+        """
         from qdrant_client import models
 
-        ts = _now_us()
+        ts = ts if ts is not None else _now_us()
         points: list[models.PointStruct] = []
         for idx, chunk in enumerate(chunks):
             payload = {
@@ -402,11 +414,7 @@ class QdrantStore:
             )
 
         await self._client.upsert(collection_name=physical, points=points, wait=True)
-        await self._client.delete(
-            collection_name=physical,
-            points_selector=models.FilterSelector(filter=self._older_than(doc_id, ts)),
-            wait=True,
-        )
+        await self.prune_older(physical, doc_id, ts)
         newer = await self._client.count(
             collection_name=physical, count_filter=self._doc_filter(doc_id, gt=ts), exact=True
         )
@@ -421,6 +429,18 @@ class QdrantStore:
             )
             emit(logger, "ingest_superseded", collection=physical, doc_id=doc_id)
         return len(points)
+
+    async def prune_older(self, physical: str, doc_id: str, ts: int) -> None:
+        """Delete every version of doc_id older than ts (idempotent). Also run when an ingest finds
+        the newest version unchanged, so a write whose clean-up failed is completed by its retry.
+        """
+        from qdrant_client import models
+
+        await self._client.delete(
+            collection_name=physical,
+            points_selector=models.FilterSelector(filter=self._older_than(doc_id, ts)),
+            wait=True,
+        )
 
     async def delete_document(self, logical: str, doc_id: str) -> None:
         """Delete every version of a document wherever it is written."""
@@ -539,6 +559,8 @@ class QdrantStore:
 
     async def drop_physical(self, physical: str) -> None:
         """Delete an old physical collection that nothing serves or writes."""
+        if not self.ready:
+            await self.ensure_collections()  # know what is served before deleting anything
         in_use = {name for s in self._states.values() for name in (s.serving, s.target)}
         if physical in in_use:
             raise ValueError(f"'{physical}' is being served or written; it cannot be deleted")

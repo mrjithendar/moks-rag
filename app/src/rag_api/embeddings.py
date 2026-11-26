@@ -3,18 +3,29 @@
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 import httpx
 
 from rag_api import metrics
 from rag_api.config import Settings
-from rag_api.errors import EmbeddingInputTooLong, from_response, upstream
+from rag_api.errors import EmbeddingInputTooLong, UpstreamError, from_response, upstream
 from rag_api.logs import emit
 from rag_api.sparse import SparseVectorData, encode_sparse_bm25
 
 logger = logging.getLogger("rag_api.embeddings")
 
 DEPENDENCY = "bge-m3"
+
+
+def _json(resp: httpx.Response) -> dict[str, Any]:
+    try:
+        body = resp.json()
+    except ValueError as exc:
+        raise UpstreamError(DEPENDENCY, "answered with something that is not JSON") from exc
+    if not isinstance(body, dict):
+        raise UpstreamError(DEPENDENCY, "answered with JSON that is not an object")
+    return body
 
 
 class EmbeddingClient:
@@ -53,9 +64,10 @@ class EmbeddingClient:
             batch = texts[start : start + self._batch_size]
             vectors = await self._embed_dense_batch(batch, truncate=truncate)
             for vec in vectors:
-                if len(vec) != self._dim:
-                    raise ValueError(
-                        f"Expected {self._dim}-dim embedding from bge-m3, got {len(vec)}"
+                if not isinstance(vec, list) or len(vec) != self._dim:
+                    size = len(vec) if isinstance(vec, list) else type(vec).__name__
+                    raise UpstreamError(
+                        DEPENDENCY, f"returned a {size}-dim embedding, expected {self._dim}"
                     )
             all_vectors.extend(vectors)
         return all_vectors
@@ -77,9 +89,11 @@ class EmbeddingClient:
                         "chunk_size"
                     )
                 raise from_response(DEPENDENCY, resp, text[:300])
-            embeddings = resp.json().get("embeddings")
+            embeddings = _json(resp).get("embeddings")
             if not isinstance(embeddings, list) or len(embeddings) != len(batch):
-                raise ValueError("Unexpected /api/embed response from bge-m3")
+                raise UpstreamError(
+                    DEPENDENCY, "answered /api/embed without one embedding per input"
+                )
             return embeddings
 
         with upstream(DEPENDENCY):
@@ -87,11 +101,16 @@ class EmbeddingClient:
                 f"{self._base_url}/v1/embeddings", json={"model": self._model, "input": batch}
             )
             resp.raise_for_status()
-        data = resp.json().get("data")
+        data = _json(resp).get("data")
         if not isinstance(data, list) or len(data) != len(batch):
-            raise ValueError("Unexpected /v1/embeddings response from bge-m3")
-        ordered = sorted(data, key=lambda item: item.get("index", 0))
-        return [item["embedding"] for item in ordered]
+            raise UpstreamError(
+                DEPENDENCY, "answered /v1/embeddings without one embedding per input"
+            )
+        try:
+            ordered = sorted(data, key=lambda item: item.get("index", 0))
+            return [item["embedding"] for item in ordered]
+        except (AttributeError, KeyError, TypeError) as exc:
+            raise UpstreamError(DEPENDENCY, "answered /v1/embeddings in an unknown shape") from exc
 
     @staticmethod
     def embed_sparse(texts: list[str]) -> list[SparseVectorData]:
