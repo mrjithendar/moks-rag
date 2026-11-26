@@ -322,6 +322,16 @@ class QdrantStore:
             must.append(models.FieldCondition(key="ingest_ts", range=models.Range(**ts)))
         return models.Filter(must=must)
 
+    @staticmethod
+    def _older_than(doc_id: str, ts: int) -> Any:
+        """Chunks of doc_id written before ts, 0.1.0 chunks (no ingest_ts) included."""
+        from qdrant_client import models
+
+        return models.Filter(
+            must=[models.FieldCondition(key="doc_id", match=models.MatchValue(value=doc_id))],
+            must_not=[models.FieldCondition(key="ingest_ts", range=models.Range(gte=ts))],
+        )
+
     # --- documents ---
     # --------------------------------------------------------------------------------------------
 
@@ -394,7 +404,7 @@ class QdrantStore:
         await self._client.upsert(collection_name=physical, points=points, wait=True)
         await self._client.delete(
             collection_name=physical,
-            points_selector=models.FilterSelector(filter=self._doc_filter(doc_id, lt=ts)),
+            points_selector=models.FilterSelector(filter=self._older_than(doc_id, ts)),
             wait=True,
         )
         newer = await self._client.count(

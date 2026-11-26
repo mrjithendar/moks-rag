@@ -101,6 +101,36 @@ async def test_non_empty_legacy_collection_is_kept_until_promoted(
     assert "cms_content" not in {c.name for c in (await qdrant.get_collections()).collections}
 
 
+async def test_reingest_into_legacy_collection_replaces_its_old_chunks(
+    qdrant: AsyncQdrantClient,
+) -> None:
+    await qdrant.create_collection(
+        "sre_knowledge",
+        vectors_config={"dense": models.VectorParams(size=32, distance=models.Distance.COSINE)},
+        sparse_vectors_config={"sparse": models.SparseVectorParams(modifier=models.Modifier.IDF)},
+    )
+    await qdrant.upsert(
+        "sre_knowledge",
+        points=[
+            models.PointStruct(
+                id=i,
+                vector={"dense": [1.0] * 32},
+                payload={"doc_id": "rb", "chunk_index": i, "text": f"0.1.0 chunk {i}"},
+            )
+            for i in range(3)
+        ],
+    )
+    s = QdrantStore(make_settings(), client=qdrant)
+    await s.ensure_collections()
+    await Indexer(make_settings(), s, FakeEmbeddingClient()).ingest(
+        doc("rb", "the runbook, re-sent")
+    )
+    legacy = await doc_points(qdrant, "sre_knowledge", "rb")
+    assert [p.payload["text"] for p in legacy] == ["the runbook, re-sent"]
+    assert len(await doc_points(qdrant, "sre_knowledge__v2", "rb")) == 1
+    assert await s.count_without_source("sre_knowledge") == 0
+
+
 async def test_replace_never_leaves_old_chunks(
     store: QdrantStore, qdrant: AsyncQdrantClient
 ) -> None:
