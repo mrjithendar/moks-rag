@@ -5,6 +5,9 @@
   written ("unchanged": true).
 - INGEST_MAX_CONCURRENCY bounds how many ingests embed at once, so a bulk reindex cannot queue every
   query embedding behind it (queries do not take a slot). Empty = no limit.
+- Ingests of one document (collection + doc_id) take turns, in arrival order: a caller that gave up
+  and sent the same document again waits for the first send instead of embedding it a second time
+  beside it, and then finds it unchanged. Different documents still run side by side.
 - The source document is stored with chunk 0, so POST /admin/collections/{name}/rebuild can rebuild
   a new index version without the callers re-sending anything.
 """
@@ -56,6 +59,12 @@ class IngestDoc:
 
 
 @dataclass
+class _DocumentTurn:
+    lock: asyncio.Lock
+    users: int = 0
+
+
+@dataclass
 class IngestOutcome:
     chunks: int
     unchanged: bool
@@ -72,8 +81,42 @@ class Indexer:
         self._embeddings = embeddings
         limit = settings.ingest_max_concurrency
         self._slots = asyncio.Semaphore(limit) if limit else None
+        self._turns: dict[tuple[str, str], _DocumentTurn] = {}
         self.rebuilds: dict[str, dict[str, Any]] = {}
         self._rebuild_tasks: dict[str, asyncio.Task[None]] = {}
+
+    @contextlib.asynccontextmanager
+    async def document_turn(self, collection: str, doc_id: str) -> AsyncIterator[float]:
+        """This document's turn: one ingest of it at a time, in arrival order. Yields how long it
+        waited for the ingests of the same document ahead of it, in seconds.
+
+        Without it, a caller that gives up before rag-api answers and sends again (moks-cms waited
+        10 s per attempt, three attempts) started the same embedding two and three times at once:
+        bge-m3 queued them all, and every batch then timed out (504).
+        """
+        key = (collection, doc_id)
+        turn = self._turns.get(key)
+        if turn is None:
+            turn = self._turns[key] = _DocumentTurn(asyncio.Lock())
+        turn.users += 1
+        started = time.monotonic()
+        try:
+            if turn.lock.locked():
+                metrics.INGESTS_WAITING_FOR_DOCUMENT.inc()
+                try:
+                    await turn.lock.acquire()
+                finally:
+                    metrics.INGESTS_WAITING_FOR_DOCUMENT.dec()
+            else:
+                await turn.lock.acquire()
+            try:
+                yield time.monotonic() - started
+            finally:
+                turn.lock.release()
+        finally:
+            turn.users -= 1
+            if turn.users == 0:
+                self._turns.pop(key, None)
 
     @contextlib.asynccontextmanager
     async def slot(self) -> AsyncIterator[None]:

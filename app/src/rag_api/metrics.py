@@ -71,6 +71,10 @@ INGESTS_IN_PROGRESS = Gauge("rag_api_ingests_in_progress", "Ingests currently ru
 INGESTS_WAITING = Gauge(
     "rag_api_ingests_waiting", "Ingests waiting for a slot (INGEST_MAX_CONCURRENCY)"
 )
+INGESTS_WAITING_FOR_DOCUMENT = Gauge(
+    "rag_api_ingests_waiting_for_document",
+    "Ingests waiting for an earlier ingest of the same document to finish",
+)
 UPSTREAM_ERRORS = Counter(
     "rag_api_upstream_errors_total",
     "Failed calls to a dependency, by kind (unavailable, timeout, rate_limited, rejected, error)",

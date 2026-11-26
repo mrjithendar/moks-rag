@@ -454,9 +454,15 @@ def create_app(
         title, source = payload.title, payload.source
         indexer: Indexer = request.app.state.indexer
         labels = {"service": principal.metrics_service, "collection": collection}
+        waited_s = 0.0
 
         try:
-            async with indexer.slot():
+            # One ingest of this document at a time (a resend waits for the first and then finds it
+            # unchanged); the slot is taken only once it is this request's turn.
+            async with (
+                indexer.document_turn(collection, payload.doc_id) as waited_s,
+                indexer.slot(),
+            ):
                 text = payload.text
                 if upload is not None:
                     raw_bytes = await upload.read()
@@ -527,6 +533,7 @@ def create_app(
             chunks_ingested=outcome.chunks,
             unchanged=outcome.unchanged,
             parsed_via_docling=parsed_via_docling,
+            waited_for_same_document_s=round(waited_s, 3),
         )
         return IngestResponse(
             doc_id=payload.doc_id,

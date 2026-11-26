@@ -2,14 +2,25 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from fastapi.testclient import TestClient
 
 from rag_api.errors import UpstreamError
-from tests.conftest import auth, build_client, ingest, make_settings, sse_events, svc
+from rag_api.sparse import SparseVectorData
+from tests.conftest import (
+    FakeEmbeddingClient,
+    auth,
+    build_client,
+    ingest,
+    make_settings,
+    sse_events,
+    svc,
+)
 
 RUNBOOK = (
     "# Istio 503 Runbook\n\n## Symptoms\n\nClients see 503 UF upstream connect errors.\n\n"
@@ -86,6 +97,57 @@ def test_reingesting_same_document_is_unchanged(client: TestClient, fakes: dict[
         client, "sre_knowledge", "rb-1", RUNBOOK + "\n\nAlso restart the pod.", title="Istio 503"
     )
     assert third["unchanged"] is False
+
+
+class SlowEmbeddings(FakeEmbeddingClient):
+    """Embeds like the fake, but takes a while, and counts how many embeddings ran at once."""
+
+    def __init__(self, delay: float) -> None:
+        super().__init__()
+        self.delay = delay
+        self.running = 0
+        self.most_at_once = 0
+
+    async def embed_documents(
+        self, texts: list[str]
+    ) -> tuple[list[list[float]], list[SparseVectorData]]:
+        self.running += 1
+        self.most_at_once = max(self.most_at_once, self.running)
+        try:
+            await asyncio.sleep(self.delay)
+            return await super().embed_documents(texts)
+        finally:
+            self.running -= 1
+
+
+def test_resends_of_one_document_take_turns_and_embed_once(
+    settings: Any, fakes: dict[str, Any], caplog: Any
+) -> None:
+    # moks-cms gave up after 10 s and sent the same post again, twice: three ingests of one document
+    # at once used to embed it three times side by side, and bge-m3 timed them all out (504).
+    caplog.set_level(logging.INFO, logger="rag_api.access")
+    slow = SlowEmbeddings(delay=0.3)
+    fakes["embeddings"] = slow
+    with build_client(settings, fakes) as client, ThreadPoolExecutor(3) as pool:
+        bodies = list(
+            pool.map(lambda _: ingest(client, "cms_content", "blog:same", RUNBOOK), range(3))
+        )
+    assert len(slow.document_calls) == 1 and slow.most_at_once == 1
+    assert sorted(b["unchanged"] for b in bodies) == [False, True, True]
+    records = [json.loads(r.message) for r in caplog.records if r.name == "rag_api.access"]
+    waits = sorted(r["waited_for_same_document_s"] for r in records if r["event"] == "rag_ingest")
+    assert waits[0] < 0.1 and waits[1] >= 0.2 and waits[2] >= 0.2
+
+
+def test_different_documents_still_ingest_side_by_side(
+    settings: Any, fakes: dict[str, Any]
+) -> None:
+    slow = SlowEmbeddings(delay=0.3)
+    fakes["embeddings"] = slow
+    with build_client(settings, fakes) as client, ThreadPoolExecutor(3) as pool:
+        posts = [(f"blog:post-{i}", f"{RUNBOOK}\n\nPost {i}.") for i in range(3)]
+        list(pool.map(lambda post: ingest(client, "cms_content", *post), posts))
+    assert len(slow.document_calls) == 3 and slow.most_at_once == 3
 
 
 def test_ingest_multipart_pdf_uses_docling(client: TestClient, fakes: dict[str, Any]) -> None:
