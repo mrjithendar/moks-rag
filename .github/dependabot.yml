@@ -1,0 +1,19 @@
+# Dependabot version updates for the workflows' actions (pinned by commit SHA; Dependabot updates the SHA and the
+# version comment). A merged update that changes build-and-deploy.yaml rebuilds and redeploys rag-api.
+version: 2
+
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: America/New_York
+    cooldown:
+      default-days: 14
+    commit-message:
+      prefix: "deps(ci)"
+    groups:
+      actions:
+        patterns: ["*"]

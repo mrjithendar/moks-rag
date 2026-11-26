@@ -1,17 +1,22 @@
 name: Deploy ArgoCD Applications
 
+# validate → pull requests touching deploy/: the Argo CD files parse and the Kustomize stack (deploy/k8s) renders.
+# deploy   → pushes to main touching deploy/argocd/ (and manual runs on main): apply the AppProject and the two
+#            Applications with ServiceAccount argocd/github-rag-argocd-deployer (deploy/argocd/ci-rbac.yaml; vars
+#            K8S_API_SERVER, K8S_CA_DATA, secret K8S_ARGOCD_TOKEN), then refresh them and report their status.
+# deploy/k8s itself is never applied from here: Argo CD (moks-rag-stack) syncs it from main.
+
 on:
   push:
-    branches:
-      - main
+    branches: [main]
     paths:
       - "deploy/argocd/**"
       - ".github/workflows/deploy-argocd-apps.yaml"
   pull_request:
-    branches:
-      - main
+    branches: [main]
     paths:
       - "deploy/argocd/**"
+      - "deploy/k8s/**"
       - ".github/workflows/deploy-argocd-apps.yaml"
   workflow_dispatch:
     inputs:
@@ -24,24 +29,26 @@ permissions:
   contents: read
 
 concurrency:
-  group: deploy-argocd-apps-${{ github.ref }}
-  cancel-in-progress: false
+  group: deploy-argocd-apps-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   validate:
     name: Validate ArgoCD & Kustomize Manifests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 5
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up kubectl
-        uses: azure/setup-kubectl@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          version: "v1.32.0"
+          persist-credentials: false
+
+      - uses: azure/setup-kubectl@bda439f5f36b99b262ebdcd3613869bddb064c8e # v5.2.0
+        with:
+          version: v1.35.0
 
       - name: Validate YAML syntax
         run: |
+          pip install --quiet pyyaml==6.0.3
           python3 - <<'EOF'
           import pathlib, yaml
           for p in sorted(pathlib.Path("deploy/argocd").glob("*.yaml")):
@@ -56,32 +63,32 @@ jobs:
   deploy:
     name: Apply ArgoCD Apps to Hetzner k3s
     needs: validate
-    if: github.event_name != 'pull_request'
-    runs-on: ubuntu-latest
+    # Only main is deployed: a manual run on another branch would apply that branch's Applications.
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 10
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up kubectl
-        uses: azure/setup-kubectl@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          version: "v1.32.0"
+          persist-credentials: false
+
+      - uses: azure/setup-kubectl@bda439f5f36b99b262ebdcd3613869bddb064c8e # v5.2.0
+        with:
+          version: v1.35.0
 
       - name: Configure kubeconfig
         env:
-          KUBECONFIG_B64: ${{ secrets.KUBECONFIG_B64 }}
           K8S_API_SERVER: ${{ vars.K8S_API_SERVER }}
           K8S_CA_DATA: ${{ vars.K8S_CA_DATA }}
           K8S_ARGOCD_TOKEN: ${{ secrets.K8S_ARGOCD_TOKEN }}
         run: |
           set -euo pipefail
+          for v in K8S_API_SERVER K8S_CA_DATA K8S_ARGOCD_TOKEN; do
+            [[ -n "${!v}" ]] || { echo "::error::$v is not set (vars K8S_API_SERVER, K8S_CA_DATA; secret K8S_ARGOCD_TOKEN)"; exit 1; }
+          done
           KCFG="$RUNNER_TEMP/kubeconfig"
           umask 077
-
-          if [[ -n "$KUBECONFIG_B64" ]]; then
-            printf '%s' "$KUBECONFIG_B64" | base64 --decode > "$KCFG"
-          elif [[ -n "$K8S_API_SERVER" && -n "$K8S_CA_DATA" && -n "$K8S_ARGOCD_TOKEN" ]]; then
-            cat > "$KCFG" <<EOF
+          cat > "$KCFG" <<EOF
           apiVersion: v1
           kind: Config
           clusters:
@@ -101,11 +108,6 @@ jobs:
               namespace: argocd
           current-context: hetzner-k3s
           EOF
-          else
-            echo "::error::Configure either secret KUBECONFIG_B64 or (vars K8S_API_SERVER, K8S_CA_DATA + secret K8S_ARGOCD_TOKEN)."
-            exit 1
-          fi
-
           echo "KUBECONFIG=$KCFG" >> "$GITHUB_ENV"
           kubectl --kubeconfig "$KCFG" --request-timeout=20s get --raw /readyz > /dev/null
 
@@ -118,7 +120,6 @@ jobs:
           if [[ "$DRY_RUN" == "true" ]]; then
             EXTRA_ARGS+=(--dry-run=server)
           fi
-
           kubectl apply "${EXTRA_ARGS[@]}" -f deploy/argocd/project.yaml
           kubectl apply "${EXTRA_ARGS[@]}" -f deploy/argocd/qdrant-app.yaml
           kubectl apply "${EXTRA_ARGS[@]}" -f deploy/argocd/rag-stack-app.yaml
@@ -127,32 +128,30 @@ jobs:
         if: ${{ !inputs.dry_run }}
         run: |
           set -euo pipefail
-          for app in moks-rag-qdrant moks-rag-stack; do
-            kubectl -n argocd annotate application "$app" \
-              argocd.argoproj.io/refresh=hard --overwrite
+          apps=(moks-rag-qdrant moks-rag-stack)
+          for app in "${apps[@]}"; do
+            kubectl -n argocd annotate application "$app" argocd.argoproj.io/refresh=hard --overwrite
           done
-
-          # Wait briefly for ArgoCD reconciliation to observe any updated Application spec
+          # Up to 3 minutes for Argo CD to reconcile. Not reaching Synced/Healthy is reported, not failed: a sync can
+          # legitimately take longer (Qdrant's StatefulSet), and Argo CD keeps going after this job.
+          status() { kubectl -n argocd get application "$1" -o jsonpath='{.status.sync.status}/{.status.health.status}'; }
           for attempt in $(seq 1 18); do
-            q_sync=$(kubectl -n argocd get application moks-rag-qdrant -o jsonpath='{.status.sync.status}')
-            q_health=$(kubectl -n argocd get application moks-rag-qdrant -o jsonpath='{.status.health.status}')
-            s_sync=$(kubectl -n argocd get application moks-rag-stack -o jsonpath='{.status.sync.status}')
-            s_health=$(kubectl -n argocd get application moks-rag-stack -o jsonpath='{.status.health.status}')
-            echo "Attempt ${attempt}: qdrant=${q_sync}/${q_health}, stack=${s_sync}/${s_health}"
-            if [[ "$q_sync" == "Synced" && "$q_health" == "Healthy" && "$s_sync" == "Synced" && "$s_health" == "Healthy" ]]; then
-              break
-            fi
+            line="" ready=true
+            for app in "${apps[@]}"; do
+              s=$(status "$app"); line+=" $app=$s"
+              [[ "$s" == Synced/Healthy ]] || ready=false
+            done
+            echo "Attempt ${attempt}:${line}"
+            [[ "$ready" == true ]] && break
             sleep 10
           done
-
+          [[ "$ready" == true ]] || echo "::warning::Not Synced/Healthy after 3 minutes:${line}"
           {
             echo "### ArgoCD Application Status"
             echo '```'
-            kubectl -n argocd get applications moks-rag-qdrant moks-rag-stack
+            kubectl -n argocd get applications "${apps[@]}"
             echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          kubectl -n argocd get applications moks-rag-qdrant moks-rag-stack
+          } | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Clean up kubeconfig
         if: always()
