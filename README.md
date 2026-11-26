@@ -341,6 +341,8 @@ curl -X DELETE -H "Authorization: Bearer $ADMIN" http://rag-api.rag.svc.cluster.
 
 Re-ingesting never deletes first: new chunks are written under new point ids, then older versions of the `doc_id` are removed, so a search never sees the document missing and a failed write keeps the previous version.
 
+Ingests of one document (same collection and `doc_id`) take turns, in arrival order; different documents still run side by side. A caller that gives up before rag-api answers and sends the same document again therefore waits for the first send and then gets `"unchanged": true`, instead of embedding it a second time beside the first (that is how moks-cms's 10-second retries used to queue bge-m3 into 504s). The `rag_ingest` log line carries `waited_for_same_document_s`; `rag_api_ingests_waiting_for_document` counts the ones waiting.
+
 ## Limits and tuning
 
 All of these are empty in `deploy/k8s/rag-api.yaml`, which means **no limit**; set numbers there when you want one.
@@ -364,7 +366,7 @@ rag-api serves Prometheus metrics on `:9464` (`METRICS_PORT`), never routed by t
 | `rag_api_stage_duration_seconds{stage}` | `embed_query`, `embed_documents`, `search`, `rerank`, `docling`, `llm`, `condense` |
 | `rag_api_retrievals_total`, `rag_api_retrieval_zero_hits_total` | searches and empty results, by service and collection |
 | `rag_api_llm_tokens_total{service,model,purpose,kind}` | tokens LiteLLM reported (`purpose`: answer, chat, condense, task), streamed answers included |
-| `rag_api_ingests_total{outcome}`, `rag_api_ingest_chunks_total`, `rag_api_ingests_in_progress`, `rag_api_ingests_waiting` | the write path |
+| `rag_api_ingests_total{outcome}`, `rag_api_ingest_chunks_total`, `rag_api_ingests_in_progress`, `rag_api_ingests_waiting`, `rag_api_ingests_waiting_for_document` | the write path |
 | `rag_api_upstream_errors_total{dependency,kind}` | failed calls to bge-m3, qdrant, docling-serve, litellm |
 | `rag_api_collection_info{collection,physical,mode}` | which physical collection each alias serves |
 
