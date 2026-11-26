@@ -110,10 +110,10 @@ spec:
           resources:
             requests:
               cpu: 100m
-              memory: 256Mi
+              memory: 384Mi
             limits:
               cpu: "1"
-              memory: 768Mi
+              memory: 1536Mi
           volumeMounts:
             - name: config
               mountPath: /app/config
