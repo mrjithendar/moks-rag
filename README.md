@@ -11,7 +11,7 @@ All components run in the `rag` namespace and communicate over internal Kubernet
 | `bge-m3` | `ollama/ollama:0.40.16` (`bge-m3:567m`) | `http://bge-m3.rag.svc.cluster.local:8001` (and `:11434`) | 1024-dim dense embeddings on ARM64 CPU (migrated from `embeddings` namespace) |
 | `qdrant` | Helm `qdrant/qdrant` chart `1.20.2` (ArgoCD multi-source) | `http://qdrant.rag.svc.cluster.local:6333` | Vector store (`15Gi` PVC; 3 aliases over versioned dense+sparse collections, see [Index versions](#index-versions)) |
 | `docling-serve` | `ghcr.io/docling-project/docling-serve-cpu` 1.39.0, pinned by digest | `http://docling-serve.rag.svc.cluster.local:5001` | Document parsing (PDF/DOCX/HTML -> Markdown via its async API, 2–4Gi RAM); Web UI at `jithendar.com/docling` behind the gateway's login |
-| `litellm` | `ghcr.io/berriai/litellm` 1.112.0.dev2, pinned by digest | `http://litellm.rag.svc.cluster.local:4000/v1` | OpenAI-compatible proxy: `claude-sonnet-5-5` & `claude-haiku-5-5` (config), `moks-cms-default` and UI-added models (PostgreSQL `litellm` on the shared CloudNativePG cluster); counters and model-change broadcast on the shared Valkey (database 8); Admin UI at `jithendar.com/llm/ui` |
+| `litellm` | `ghcr.io/berriai/litellm` 1.112.0.dev2, pinned by digest | `http://litellm.rag.svc.cluster.local:4000/v1` | OpenAI-compatible proxy: `claude-sonnet-5-5` & `claude-haiku-5-5` (config), `moks-cms-default`, `moks-cms-fast` (jithendar.com's gateway, moks-cms D-109) and UI-added models (PostgreSQL `litellm` on the shared CloudNativePG cluster); counters and model-change broadcast on the shared Valkey (database 8); Admin UI at `jithendar.com/llm/ui` |
 | `rag-api` | `ghcr.io/mrjithendar/moks-rag-api:<sha>` | `http://rag-api.rag.svc.cluster.local:8000` (metrics `:9464`) | Custom FastAPI orchestrator (`root_path="/rag"`) |
 | `open-webui` | `ghcr.io/open-webui/open-webui`, pinned by digest | `http://open-webui.rag.svc.cluster.local:80` | Chat UI (`2Gi` PVC) pointing at `rag-api` `/v1` |
 
@@ -315,7 +315,7 @@ Models, provider credentials and virtual keys live in PostgreSQL: database `lite
 | Kind of model | Where it is defined | Edit it in |
 | --- | --- | --- |
 | `claude-sonnet-5-5`, `claude-haiku-5-5` (rag-api's `DEFAULT_LLM_MODEL` / `FAST_LLM_MODEL`) | `litellm_config.yaml` in `deploy/k8s/litellm.yaml` | Git (the UI shows them as *Defined in config*, read-only) |
-| `moks-cms-default` | created once by the Job `litellm-seed-models` from `deploy/k8s/litellm.yaml` | the Admin UI |
+| `moks-cms-default`, `moks-cms-fast` | created once by the Job `litellm-seed-models` from `deploy/k8s/litellm.yaml` | the Admin UI |
 | everything you add in the UI | PostgreSQL | the Admin UI |
 
 Never give a UI model the name of a config model: LiteLLM would then serve both under that name, in turn.
@@ -366,25 +366,45 @@ The master key (`LITELLM_MASTER_KEY`) is for administration over the API only. A
      -H 'Content-Type: application/json' -d '{"model":"<public name>","messages":[{"role":"user","content":"ping"}]}'
    ```
 
-### Creating a virtual key for moks-cms
+### LiteLLM as jithendar.com's gateway (moks-cms D-109)
 
-1. *Virtual Keys* → **Create New Key**. Key name `moks-cms`; **Models**: only `moks-cms-default`. Budget, rate limits (TPM/RPM) and expiry are optional: leave them empty for no limit, or set your own.
-2. **Create Key** shows the key once. Copy it.
-3. Put it in moks-cms's Secret, through stdin:
+Every text model call of jithendar.com goes through LiteLLM (moks-cms `docs/LLM_GATEWAY.md`). These are the SEO agent's
+flows and crews, Ask the Blog, the web app's drafts and enrichment, and the Python practice tutor. moks-cms asks for two
+aliases, `moks-cms-default` (drafting, crews) and `moks-cms-fast` (classifying, Ask the Blog, enrichment, the tutor);
+the Job `litellm-seed-models` creates both. The budgets are LiteLLM's: the team `jithendar.com` and one virtual key
+per caller.
+
+1. **Keys.** Create the team and the keys, and write them into the site's Secrets:
    ```bash
-   K="$(pbpaste)"
-   kubectl -n jithendar patch secret jithendar-com-env --type merge --patch-file /dev/stdin <<EOF
-   {"stringData": {"LITELLM_API_KEY": "$K"}}
-   EOF
-   unset K; pbcopy </dev/null
+   scripts/issue-litellm-keys.sh            # KUBE_CONTEXT=<name> to refuse any other context
    ```
-   The site loads `jithendar-com-env` with `envFrom`, so new site pods see `LITELLM_API_KEY`; running pods keep their environment until they are replaced. Today nothing in moks-cms reads it: moks-cms has no LiteLLM client yet. Wiring it means a client in moks-cms calling `http://litellm.rag.svc.cluster.local:4000/v1` with model `moks-cms-default`, and an egress rule to `rag`/`app=litellm` port 4000 in jithendar.com's `kubernetes/30-jithendar-com.yaml` NetworkPolicy. The `litellm-callers` AuthorizationPolicy here already admits namespace `jithendar`.
+   | Key | Secret (namespace jithendar) | Read by |
+   |---|---|---|
+   | `jithendar-agent` | `seo-agent-env` `LITELLM_API_KEY` | the SEO agent's flows and crews |
+   | `jithendar-ask` | `seo-agent-env` `LITELLM_ASK_API_KEY` | Ask the Blog (readers) |
+   | `jithendar-web` | `jithendar-com-env` `LITELLM_API_KEY` | the web app's drafts, keyword intents, enrichment |
+   | `jithendar-practice` | `jithendar-com-env` `LITELLM_PRACTICE_API_KEY` | the Python practice tutor |
 
-That key can call `moks-cms-default` and nothing else (another model answers 403). It is not the master key, and must never be: a leaked master key can create keys and change every model and credential.
+   Each key may use only the two aliases. The script never prints a key. It keeps a key that exists (its value cannot be
+   read back), and `--rotate` replaces every key: the old ones stop working at once.
+2. **Wiring** (jithendar.com). The manifests set `LITELLM_BASE_URL=http://litellm.rag.svc.cluster.local:4000/v1` on
+   both containers, and the NetworkPolicy allows egress to `rag`/`app=litellm` port 4000. The `litellm-callers`
+   AuthorizationPolicy here already admits namespace `jithendar`. Restart: `kubectl -n jithendar rollout restart
+   deploy/jithendar-com`.
+3. **Budgets.** Set them in the Admin UI. *Teams* → `jithendar.com` takes the budget for everything together (for
+   example per 30 days). *Virtual Keys* take one per caller: Ask the Blog's at least, since readers start it. Rate
+   limits (RPM/TPM) are optional. Nothing is preset: empty is no limit. A call over a budget is refused with HTTP 422
+   `budget_exceeded`, and moks-cms pauses the flow or shows the reader that the assistant is unavailable.
+4. **Check.** Settings → AI & models → LLM providers & budget on the site shows LiteLLM's view, read with the keys:
+   the team, each key's spend, budget and reset, and what each alias points at. The SEO agent logs
+   `llm gateway: litellm` at start.
+
+A key is not the master key, and must never be: a leaked master key can create keys and change every model and
+credential.
 
 ### Switching the model live
 
-The callers' model name stays `moks-cms-default`; only what it points at changes.
+The callers' model names stay `moks-cms-default` and `moks-cms-fast`; only what they point at changes.
 
 1. Open https://jithendar.com/llm/ui/ → **Models + Endpoints**.
 2. Click the model ID of `moks-cms-default` (its *Model Information* shows the current provider model).
