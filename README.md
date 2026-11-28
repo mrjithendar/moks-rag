@@ -11,7 +11,7 @@ All components run in the `rag` namespace and communicate over internal Kubernet
 | `bge-m3` | `ollama/ollama:0.40.16` (`bge-m3:567m`) | `http://bge-m3.rag.svc.cluster.local:8001` (and `:11434`) | 1024-dim dense embeddings on ARM64 CPU (migrated from `embeddings` namespace) |
 | `qdrant` | Helm `qdrant/qdrant` chart `1.20.2` (ArgoCD multi-source) | `http://qdrant.rag.svc.cluster.local:6333` | Vector store (`15Gi` PVC; 3 aliases over versioned dense+sparse collections, see [Index versions](#index-versions)) |
 | `docling-serve` | `ghcr.io/docling-project/docling-serve-cpu` 1.39.0, pinned by digest | `http://docling-serve.rag.svc.cluster.local:5001` | Document parsing (PDF/DOCX/HTML -> Markdown via its async API, 2–4Gi RAM); Web UI at `jithendar.com/docling` behind the gateway's login |
-| `litellm` | `ghcr.io/berriai/litellm` 1.112.0.dev2, pinned by digest | `http://litellm.rag.svc.cluster.local:4000/v1` | OpenAI-compatible proxy: `claude-sonnet-5-5` & `claude-haiku-5-5` (rag-api), `moks-cms-default`, `moks-cms-fast` (jithendar.com's gateway, moks-cms D-109) and UI-added models, all database models (PostgreSQL `litellm` on the shared CloudNativePG cluster); counters and model-change broadcast on the shared Valkey (database 8); Admin UI at `jithendar.com/llm/ui` |
+| `litellm` | `ghcr.io/berriai/litellm` 1.112.0.dev2, pinned by digest | `http://litellm.rag.svc.cluster.local:4000/v1` | OpenAI-compatible proxy: `claude-sonnet-5-5` & `claude-haiku-5-5` (rag-api), `cms-claude-sonnet-latest`, `ops-claude-haiku-latest` (jithendar.com's gateway, moks-cms D-109) and UI-added models, all database models (PostgreSQL `litellm` on the shared CloudNativePG cluster); counters and model-change broadcast on the shared Valkey (database 8); Admin UI at `jithendar.com/llm/ui` |
 | `rag-api` | `ghcr.io/mrjithendar/moks-rag-api:<sha>` | `http://rag-api.rag.svc.cluster.local:8000` (metrics `:9464`) | Custom FastAPI orchestrator (`root_path="/rag"`) |
 | `open-webui` | `ghcr.io/open-webui/open-webui`, pinned by digest | `http://open-webui.rag.svc.cluster.local:80` | Chat UI (`2Gi` PVC) pointing at `rag-api` `/v1` |
 
@@ -317,7 +317,7 @@ Every model is added by hand in the Admin UI (**Models + Endpoints → Add Model
 | Public model name | Caller | Set in |
 | --- | --- | --- |
 | `claude-sonnet-5-5`, `claude-haiku-5-5` | rag-api (`DEFAULT_LLM_MODEL` / `FAST_LLM_MODEL`) | `deploy/k8s/rag-api.yaml` |
-| `moks-cms-default`, `moks-cms-fast` | jithendar.com (team `jithendar.com`, below) | moks-cms `LITELLM_MODEL` / `LITELLM_MODEL_FAST`, and the team's allowed models |
+| `cms-claude-sonnet-latest`, `ops-claude-haiku-latest` | jithendar.com (team `jithendar.com`, below) | moks-cms `LITELLM_MODEL` / `LITELLM_MODEL_FAST`, and the team's allowed models |
 | `moks-cms-quality` | jithendar.com: crews the site gives the Opus tier (`SEO_CREW_MODELS`), and every Opus id moks-cms had stored (its migration 0045) | jithendar.com `kubernetes/seo-agent-40-seo-agent.yaml` |
 | `moks-cms-visibility-claude`, `-chatgpt`, `-perplexity`, `-gemini` | jithendar.com's AI visibility, only for the assistants switched on: each must point at that assistant's model with web search | moks-cms Settings → AI & drafts → AI visibility |
 
@@ -403,9 +403,9 @@ The master key (`LITELLM_MASTER_KEY`) is for administration over the API only. A
 Every model call of jithendar.com goes through LiteLLM, the only gateway since moks-cms D-110 (moks-cms
 `docs/LLM_GATEWAY.md`): the SEO agent's flows and crews, Ask the Blog, the web app's drafts, enrichment and AI visibility,
 and the Python practice tutor. moks-cms keeps no provider, model, key or budget of its own, and calls no model without
-LiteLLM. It asks for the aliases in the table above: `moks-cms-default` (drafting, crews), `moks-cms-fast`
-(classifying, Ask the Blog, enrichment, the tutor), `moks-cms-quality` (the Opus tier), and the AI visibility ones that
-are switched on. Add them in the Admin UI (above) before the moks-cms release with D-110. The budgets are LiteLLM's: the
+LiteLLM. It asks for the aliases in the table above: `cms-claude-sonnet-latest` (drafting, crews),
+`ops-claude-haiku-latest` (classifying, Ask the Blog, enrichment, the tutor), `moks-cms-quality` (the Opus tier), and
+the AI visibility ones that are switched on. Add them in the Admin UI (above) before the moks-cms release with D-110. The budgets are LiteLLM's: the
 team `jithendar.com` and one virtual key per caller.
 
 1. **Keys.** Create the team and the keys, and write them into the site's Secrets:
@@ -437,12 +437,16 @@ team `jithendar.com` and one virtual key per caller.
 A key is not the master key, and must never be: a leaked master key can create keys and change every model and
 credential.
 
+**Moving from `moks-cms-default` and `moks-cms-fast` (moks-cms D-111).** Add `cms-claude-sonnet-latest` and
+`ops-claude-haiku-latest` in the Admin UI, then add both to the team's models and to each of the four keys' (*Teams* /
+*Virtual Keys* → Edit). Keep the old names until the release with D-111 runs, then delete them.
+
 ### Switching the model live
 
-The callers' model names stay `moks-cms-default` and `moks-cms-fast`; only what they point at changes.
+The callers' model names stay `cms-claude-sonnet-latest` and `ops-claude-haiku-latest`; only what they point at changes.
 
 1. Open https://jithendar.com/llm/ui/ → **Models + Endpoints**.
-2. Click the model ID of `moks-cms-default` (its *Model Information* shows the current provider model).
+2. Click the model ID of `cms-claude-sonnet-latest` (its *Model Information* shows the current provider model).
 3. **Edit Settings** → change **LiteLLM Model Name** (e.g. `anthropic/claude-sonnet-5-5` → `anthropic/claude-haiku-5-5`). For another provider, also set its credential with **Re-use Credentials** or **Update API Key**.
 4. **Save** (the UI sends `PATCH /llm/model/<id>/update`; LiteLLM writes PostgreSQL and reloads that model at once).
 5. Check the alias from the API:
@@ -453,10 +457,10 @@ The callers' model names stay `moks-cms-default` and `moks-cms-fast`; only what 
 6. Send a request with the moks-cms virtual key; the response headers name the model that answered:
    ```bash
    curl -s -D - -o /dev/null https://jithendar.com/llm/v1/chat/completions -H "Authorization: Bearer $MOKS_CMS_KEY" \
-     -H 'Content-Type: application/json' -d '{"model":"moks-cms-default","messages":[{"role":"user","content":"ping"}]}' \
+     -H 'Content-Type: application/json' -d '{"model":"cms-claude-sonnet-latest","messages":[{"role":"user","content":"ping"}]}' \
      | grep -i -E 'x-litellm-model-(group|name)'
    # x-litellm-model-name: anthropic/claude-haiku-5-5
-   # x-litellm-model-group: moks-cms-default
+   # x-litellm-model-group: cms-claude-sonnet-latest
    ```
 7. Every later request uses the new model. Neither LiteLLM nor moks-cms restarts (`kubectl -n rag get pod -l app=litellm` shows the same pod and restart count).
 
@@ -480,7 +484,7 @@ and in RedisInsight (https://jithendar.com/redis/, database 8): `litellm_config:
 
 ### Operational warnings
 
-- **`LITELLM_SALT_KEY` must never change.** It encrypts every model parameter and credential LiteLLM stores. With another salt key LiteLLM starts, but every UI-added model and credential silently disappears (they cannot be decrypted; tried on 1.112.0.dev2: `moks-cms-default` became "Invalid model name"). Virtual keys survive (they are hashed, not encrypted). Putting the old salt key back restores everything. Keep a copy outside the cluster; losing it means re-entering every model and credential.
+- **`LITELLM_SALT_KEY` must never change.** It encrypts every model parameter and credential LiteLLM stores. With another salt key LiteLLM starts, but every UI-added model and credential silently disappears (they cannot be decrypted; tried on 1.112.0.dev2: `cms-claude-sonnet-latest` became "Invalid model name"). Virtual keys survive (they are hashed, not encrypted). Putting the old salt key back restores everything. Keep a copy outside the cluster; losing it means re-entering every model and credential.
 - **Rotating secrets:** `LITELLM_MASTER_KEY` signs UI sessions and is rag-api's LiteLLM key today, so rotating it signs everyone out and needs rag-api's restart too (`kubectl -n rag rollout restart deploy/litellm deploy/rag-api`). `LITELLM_UI_PASSWORD` no longer signs in (environment sign-in is off), so it needs no rotation. A UI user's password: they change it in the UI, or it is reset ("Accessing the Admin UI"). A virtual key: create a new one with the same models, patch the caller's Secret, then delete the old key. The database password belongs to Terraform (k8s-deployments); LiteLLM reads it at start.
 - **Backups:** the shared cluster has **no backups yet** (`postgres_backups` unset in k8s-deployments: no ScheduledBackup, the replica is not a backup). Until then, dump before upgrades and now and then:
   ```bash
