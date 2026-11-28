@@ -236,7 +236,8 @@ spec:
 # body. Only the first deployment uses them: once a name exists in LiteLLM, the Admin UI owns it and nothing here
 # changes it again, so editing an entry later does not change a live model (edit it in the UI).
 #
-# moks-cms-default: the stable name moks-cms calls. Point it at another model in the Admin UI (README "Switching the
+# moks-cms-default and moks-cms-fast: the stable names moks-cms calls (moks-cms D-109: drafting and crews / classifying,
+# Ask the Blog, enrichment, the Practice tutor). Point either at another model in the Admin UI (README "Switching the
 # model live"); callers keep the name. Its key is a reference (os.environ/ANTHROPIC_API_KEY, resolved from the pod's
 # environment), so no provider key is copied into the database. If the name is deleted in the UI, the next sync of
 # moks-rag-stack creates it again from here: remove the entry first to retire it.
@@ -255,6 +256,13 @@ data:
         "model_name": "moks-cms-default",
         "litellm_params": {
           "model": "anthropic/claude-sonnet-5-5",
+          "api_key": "os.environ/ANTHROPIC_API_KEY"
+        }
+      },
+      {
+        "model_name": "moks-cms-fast",
+        "litellm_params": {
+          "model": "anthropic/claude-haiku-5-5",
           "api_key": "os.environ/ANTHROPIC_API_KEY"
         }
       }
