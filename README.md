@@ -11,7 +11,7 @@ All components run in the `rag` namespace and communicate over internal Kubernet
 | `bge-m3` | `ollama/ollama:0.40.16` (`bge-m3:567m`) | `http://bge-m3.rag.svc.cluster.local:8001` (and `:11434`) | 1024-dim dense embeddings on ARM64 CPU (migrated from `embeddings` namespace) |
 | `qdrant` | Helm `qdrant/qdrant` chart `1.20.2` (ArgoCD multi-source) | `http://qdrant.rag.svc.cluster.local:6333` | Vector store (`15Gi` PVC; 3 aliases over versioned dense+sparse collections, see [Index versions](#index-versions)) |
 | `docling-serve` | `ghcr.io/docling-project/docling-serve-cpu` 1.39.0, pinned by digest | `http://docling-serve.rag.svc.cluster.local:5001` | Document parsing (PDF/DOCX/HTML -> Markdown via its async API, 2–4Gi RAM); Web UI at `jithendar.com/docling` behind the gateway's login |
-| `litellm` | `ghcr.io/berriai/litellm` 1.112.0.dev2, pinned by digest | `http://litellm.rag.svc.cluster.local:4000/v1` | OpenAI-compatible proxy: `claude-sonnet-5-5` & `claude-haiku-5-5` (config), `moks-cms-default` and UI-added models (PostgreSQL `litellm` on the shared CloudNativePG cluster); Admin UI at `jithendar.com/llm/ui` |
+| `litellm` | `ghcr.io/berriai/litellm` 1.112.0.dev2, pinned by digest | `http://litellm.rag.svc.cluster.local:4000/v1` | OpenAI-compatible proxy: `claude-sonnet-5-5` & `claude-haiku-5-5` (config), `moks-cms-default` and UI-added models (PostgreSQL `litellm` on the shared CloudNativePG cluster); counters and model-change broadcast on the shared Valkey (database 8); Admin UI at `jithendar.com/llm/ui` |
 | `rag-api` | `ghcr.io/mrjithendar/moks-rag-api:<sha>` | `http://rag-api.rag.svc.cluster.local:8000` (metrics `:9464`) | Custom FastAPI orchestrator (`root_path="/rag"`) |
 | `open-webui` | `ghcr.io/open-webui/open-webui`, pinned by digest | `http://open-webui.rag.svc.cluster.local:80` | Chat UI (`2Gi` PVC) pointing at `rag-api` `/v1` |
 
@@ -409,6 +409,20 @@ With more than one LiteLLM pod, the others pick the change up from PostgreSQL wi
 
 What still needs Git and a restart: the config models (`claude-sonnet-5-5`, `claude-haiku-5-5`), `general_settings` / `litellm_settings` in `litellm_config.yaml`, and the environment (`SERVER_ROOT_PATH`, keys, `UI_PASSWORD`). Retiring `moks-cms-default` for good: remove it from `litellm-seed-models` first, or the next sync creates it again.
 
+### Redis (Valkey)
+
+LiteLLM uses database **8** of the shared Valkey (`redis/valkey-master`) as ACL user `litellm`, which can open no other database and run no admin command. k8s-deployments (`redis_tenants.litellm` in `vars/mk4.tfvars`) writes Secret `rag/redis-litellm-credentials`; its `uri` is LiteLLM's `REDIS_URL`.
+
+What goes there: the virtual keys' rate-limit and spend counters (so limits hold across pods and restarts), the broadcast that tells every pod at once that a model changed (channel `litellm_proxy.config_change`; without Redis the other pods notice within 30 s), and a few small config-cache keys. Counters are keyed by a hash of the virtual key, never the key itself. **No response cache:** `litellm_settings.cache` stays off, so prompts and answers never reach Valkey. Turning it on is a separate decision: they would sit in the shared Valkey, where RedisInsight's console login reads every database. Give it its own database number if you do.
+
+Valkey is optional for LiteLLM. If it does not answer when LiteLLM starts, LiteLLM runs on in-memory counters until its next restart; if it goes away later, requests go on. Tried on 1.112.0.dev2 with an ACL user like the tenant's (`-@admin -flushall -swapdb`): only `SELECT 8`, no refused command, chat answered with Redis stopped and when started without it.
+
+Check it:
+```bash
+kubectl -n rag logs deploy/litellm -c litellm | grep -i "stays in-memory"   # nothing = LiteLLM is on Valkey
+```
+and in RedisInsight (https://jithendar.com/redis/, database 8): `litellm_config:param:*` and, after traffic, `{api_key:<hash>}:tokens`.
+
 ### Operational warnings
 
 - **`LITELLM_SALT_KEY` must never change.** It encrypts every model parameter and credential LiteLLM stores. With another salt key LiteLLM starts, but every UI-added model and credential silently disappears (they cannot be decrypted; tried on 1.112.0.dev2: `moks-cms-default` became "Invalid model name"), and the seed Job would create a second `moks-cms-default`. Virtual keys survive (they are hashed, not encrypted). Putting the old salt key back restores everything. Keep a copy outside the cluster; losing it means re-entering every model and credential.
@@ -421,7 +435,7 @@ What still needs Git and a restart: the config models (`claude-sonnet-5-5`, `cla
 - **Storage:** the data sits on the cluster's two 10Gi `local-path` volumes (one per instance, pinned to its node), shared with every tenant. LiteLLM's share is small: no per-request rows (`disable_spend_logs: true`), only models, keys, users and daily spend totals.
 - **Upgrading LiteLLM:** change the image digest. Each start runs `prisma migrate deploy`; the schema only moves forward, so going back to an older image after a migration is not supported: dump first, and roll back by restoring the dump with the old image. During the rolling update the old pod keeps serving on the migrated schema; LiteLLM's default (v2) migration resolver is meant for exactly that overlap. Watch `kubectl -n rag logs deploy/litellm | grep -i migrat`.
 - **Database down = LiteLLM unready.** `/health/readiness` answers 503 while PostgreSQL cannot be reached (virtual keys cannot be checked), so rag-api's answers stop too. LiteLLM's `allow_requests_on_db_unavailable` would keep serving, but would also stop checking keys; it stays off because `/llm` is public. The cluster fails over to its replica on its own.
-- **Memory:** 1.16 GiB working set before the database; requests 1Gi, limit 2Gi. The previous 1.5 GiB limit killed the container when a second process (the prisma CLI) started beside it.
+- **Memory:** 1.16 GiB working set before the database; requests 1Gi, limit 2Gi. The previous 1.5 GiB limit killed the container when a second process (the prisma CLI) started beside it. A rollout runs a second LiteLLM pod until the new one is ready, and starting is the expensive part: on 2026-11-28 two LiteLLM pods starting on worker1 at once (a pending rollout plus a `rollout restart`) used up that node's memory, which was already ~80% used against ~69% requested; the node went NotReady for 11 minutes and the kernel killed docling-serve. Before `kubectl -n rag rollout restart deploy/litellm`, wait for any rollout in progress and look at `kubectl top nodes`.
 
 ### Shared origin: the UI's session cookie
 
@@ -440,6 +454,7 @@ Until the UI moves to its own host name (e.g. `llm.jithendar.com`, the lasting f
 | UI blank, or `/llm/ui/` shows the site's 404 | `curl -sI https://jithendar.com/llm/ui/` must carry `cache-control: no-store, no-transform` (set by the `litellm` VirtualService); if not, the edge delegate `llm` (k8s-deployments) is missing. LiteLLM's log must not say `Cannot apply server_root_path replacements` |
 | A model added in the UI is missing | `kubectl -n rag logs deploy/litellm | grep -i decrypt` (salt key changed?); a name equal to a config model? |
 | Seed Job failed | `kubectl -n rag logs job/litellm-seed-models` |
+| Log says `cross-pod coordination stays in-memory` | Valkey did not answer at start-up, or Secret `redis-litellm-credentials` is missing (`kubectl -n rag get secret redis-litellm-credentials`): fix that, then restart LiteLLM (see Memory above) |
 
 How `/llm` works: the `litellm` VirtualService in `deploy/k8s/istio-routing.yaml` keeps the prefix (LiteLLM runs with `SERVER_ROOT_PATH=/llm` and rewrites its UI files for it at start-up), redirects `/llm`, `/llm/` and `/llm/ui` to `/llm/ui/`, and sets `Cache-Control: no-store` on everything except the UI's hashed files under `/llm/_next/static/`. It matches only `/llm` and `/llm/...`, so the site keeps `/llms.txt`. `PROXY_BASE_URL=https://jithendar.com/llm` gives the UI its API base; `FORWARDED_ALLOW_IPS=127.0.0.6` (the sidecar) lets LiteLLM's own redirects say `https://`. The `litellm-callers` AuthorizationPolicy admits the gateway and namespace `jithendar` on port 4000. Two of the UI's requests leave `/llm` and get the site's 404 (`/get_favicon`, `/ui/litellm-runtime-config.json`); the UI does not need them.
 
