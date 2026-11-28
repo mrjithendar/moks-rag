@@ -11,7 +11,7 @@ All components run in the `rag` namespace and communicate over internal Kubernet
 | `bge-m3` | `ollama/ollama:0.40.16` (`bge-m3:567m`) | `http://bge-m3.rag.svc.cluster.local:8001` (and `:11434`) | 1024-dim dense embeddings on ARM64 CPU (migrated from `embeddings` namespace) |
 | `qdrant` | Helm `qdrant/qdrant` chart `1.20.2` (ArgoCD multi-source) | `http://qdrant.rag.svc.cluster.local:6333` | Vector store (`15Gi` PVC; 3 aliases over versioned dense+sparse collections, see [Index versions](#index-versions)) |
 | `docling-serve` | `ghcr.io/docling-project/docling-serve-cpu` 1.39.0, pinned by digest | `http://docling-serve.rag.svc.cluster.local:5001` | Document parsing (PDF/DOCX/HTML -> Markdown via its async API, 2–4Gi RAM); Web UI at `jithendar.com/docling` behind the gateway's login |
-| `litellm` | `ghcr.io/berriai/litellm` 1.112.0.dev2, pinned by digest | `http://litellm.rag.svc.cluster.local:4000/v1` | OpenAI-compatible proxy: `claude-sonnet-5-5` & `claude-haiku-5-5` (config), `moks-cms-default`, `moks-cms-fast` (jithendar.com's gateway, moks-cms D-109) and UI-added models (PostgreSQL `litellm` on the shared CloudNativePG cluster); counters and model-change broadcast on the shared Valkey (database 8); Admin UI at `jithendar.com/llm/ui` |
+| `litellm` | `ghcr.io/berriai/litellm` 1.112.0.dev2, pinned by digest | `http://litellm.rag.svc.cluster.local:4000/v1` | OpenAI-compatible proxy: `claude-sonnet-5-5` & `claude-haiku-5-5` (rag-api), `moks-cms-default`, `moks-cms-fast` (jithendar.com's gateway, moks-cms D-109) and UI-added models, all database models (PostgreSQL `litellm` on the shared CloudNativePG cluster); counters and model-change broadcast on the shared Valkey (database 8); Admin UI at `jithendar.com/llm/ui` |
 | `rag-api` | `ghcr.io/mrjithendar/moks-rag-api:<sha>` | `http://rag-api.rag.svc.cluster.local:8000` (metrics `:9464`) | Custom FastAPI orchestrator (`root_path="/rag"`) |
 | `open-webui` | `ghcr.io/open-webui/open-webui`, pinned by digest | `http://open-webui.rag.svc.cluster.local:80` | Chat UI (`2Gi` PVC) pointing at `rag-api` `/v1` |
 
@@ -56,7 +56,7 @@ moks-rag/
 │   │   ├── namespace.yaml
 │   │   ├── bge-m3.yaml
 │   │   ├── docling-serve.yaml
-│   │   ├── litellm.yaml         # LiteLLM, its config models, the moks-cms-default seed (PostSync Job)
+│   │   ├── litellm.yaml         # LiteLLM (no config models), the model seed (PostSync Job)
 │   │   ├── rag-api.yaml
 │   │   ├── open-webui.yaml
 │   │   ├── istio-routing.yaml
@@ -312,13 +312,15 @@ LiteLLM is at **https://jithendar.com/llm**: the Admin UI at `/llm/ui/` (`/llm` 
 
 Models, provider credentials and virtual keys live in PostgreSQL: database `litellm` on the shared CloudNativePG cluster (`postgres-db/postgres-cluster`, through PgBouncer), with its own login role. Changes made in the UI take effect without restarting LiteLLM or its callers.
 
-| Kind of model | Where it is defined | Edit it in |
-| --- | --- | --- |
-| `claude-sonnet-5-5`, `claude-haiku-5-5` (rag-api's `DEFAULT_LLM_MODEL` / `FAST_LLM_MODEL`) | `litellm_config.yaml` in `deploy/k8s/litellm.yaml` | Git (the UI shows them as *Defined in config*, read-only) |
-| `moks-cms-default`, `moks-cms-fast` | created once by the Job `litellm-seed-models` from `deploy/k8s/litellm.yaml` | the Admin UI |
-| everything you add in the UI | PostgreSQL | the Admin UI |
+Every model is a database model: `litellm_config.yaml` has no `model_list`, so nothing shows as *Defined in config*.
 
-Never give a UI model the name of a config model: LiteLLM would then serve both under that name, in turn.
+| Model | Who uses it | Created by | Edit it in |
+| --- | --- | --- | --- |
+| `claude-sonnet-5-5`, `claude-haiku-5-5` | rag-api's `DEFAULT_LLM_MODEL` / `FAST_LLM_MODEL` | the Job `litellm-seed-models` (`deploy/k8s/litellm.yaml`), when missing | the Admin UI |
+| `moks-cms-default`, `moks-cms-fast` | jithendar.com (team `jithendar.com`, below) | the Job `litellm-seed-models`, when missing | the Admin UI |
+| everything you add in the UI | whoever you give it to | you | the Admin UI |
+
+The seed Job runs after every sync of `moks-rag-stack` and creates only names that are not in the database yet, so it never undoes an edit; but it does bring back a seeded name deleted in the UI. Never give two models the same name: LiteLLM would serve both under that name, in turn.
 
 ### First deployment
 
@@ -339,10 +341,10 @@ Order matters. Each step leaves the running LiteLLM untouched until the last one
    unset SALT PASS UIUSER
    ```
    Then copy `LITELLM_SALT_KEY` and `LITELLM_UI_PASSWORD` into your password manager (`kubectl -n rag get secret rag-secrets -o jsonpath='{.data.LITELLM_SALT_KEY}' | base64 -d | pbcopy`). The salt key is the only way to read what LiteLLM stores; a database backup is useless without it.
-3. **Merge this repository's change.** The `deploy-argocd-apps` workflow applies the AppProject (it now allows `Job`), and Argo CD rolls LiteLLM: the new pod applies the database migrations (`prisma migrate deploy`, about 260 on an empty database) before serving, while the old pod keeps serving. Then the PostSync hook creates `moks-cms-default`:
+3. **Merge this repository's change.** The `deploy-argocd-apps` workflow applies the AppProject (it now allows `Job`), and Argo CD rolls LiteLLM: the new pod applies the database migrations (`prisma migrate deploy`, about 260 on an empty database) before serving, while the old pod keeps serving. Then the PostSync hook creates the seeded models:
    ```bash
    kubectl -n rag rollout status deploy/litellm --timeout=10m
-   kubectl -n rag logs job/litellm-seed-models        # moks-cms-default: created -> anthropic/claude-sonnet-5-5
+   kubectl -n rag logs job/litellm-seed-models        # claude-sonnet-5-5: created -> anthropic/claude-sonnet-5-5 ...
    ```
 
 Until steps 1 and 2 are done, the new LiteLLM pod waits for its Secret keys (`CreateContainerConfigError`) and the old pod keeps serving rag-api. If Argo CD synced before the workflow applied the AppProject, the sync fails on the Job (`batch:Job is not permitted`) and its retries pick it up a minute later.
@@ -427,7 +429,7 @@ The callers' model names stay `moks-cms-default` and `moks-cms-fast`; only what 
 
 With more than one LiteLLM pod, the others pick the change up from PostgreSQL within 30 s. A sync of `moks-rag-stack` never undoes the switch: the seed Job only creates names that do not exist.
 
-What still needs Git and a restart: the config models (`claude-sonnet-5-5`, `claude-haiku-5-5`), `general_settings` / `litellm_settings` in `litellm_config.yaml`, and the environment (`SERVER_ROOT_PATH`, keys, `UI_PASSWORD`). Retiring `moks-cms-default` for good: remove it from `litellm-seed-models` first, or the next sync creates it again.
+rag-api's `claude-sonnet-5-5` and `claude-haiku-5-5` switch the same way (with the master key in step 6). What still needs Git and a restart: `general_settings` / `litellm_settings` in `litellm_config.yaml`, and the environment (`SERVER_ROOT_PATH`, keys, `UI_PASSWORD`). Retiring a seeded name for good: move its callers to another name and remove it from `litellm-seed-models` first, or the next sync creates it again.
 
 ### Redis (Valkey)
 
@@ -472,7 +474,7 @@ Until the UI moves to its own host name (e.g. `llm.jithendar.com`, the lasting f
 | Start-up exits after "Database migration cannot proceed" | `kubectl -n rag logs deploy/litellm --previous`; usually permissions: the role must own database `litellm` |
 | Sign-in says invalid credentials | the values in `rag-secrets` (`LITELLM_UI_USERNAME`/`PASSWORD`) as of the pod's start: patching the Secret needs `kubectl -n rag rollout restart deploy/litellm`. Repeated failures block that user name for a while (HTTP 429) |
 | UI blank, or `/llm/ui/` shows the site's 404 | `curl -sI https://jithendar.com/llm/ui/` must carry `cache-control: no-store, no-transform` (set by the `litellm` VirtualService); if not, the edge delegate `llm` (k8s-deployments) is missing. LiteLLM's log must not say `Cannot apply server_root_path replacements` |
-| A model added in the UI is missing | `kubectl -n rag logs deploy/litellm | grep -i decrypt` (salt key changed?); a name equal to a config model? |
+| A model added in the UI is missing | `kubectl -n rag logs deploy/litellm | grep -i decrypt` (salt key changed?); two models with the same name? |
 | Seed Job failed | `kubectl -n rag logs job/litellm-seed-models` |
 | Log says `cross-pod coordination stays in-memory` | Valkey did not answer at start-up, or Secret `redis-litellm-credentials` is missing (`kubectl -n rag get secret redis-litellm-credentials`): fix that, then restart LiteLLM (see Memory above) |
 

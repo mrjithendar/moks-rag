@@ -1,11 +1,9 @@
 # LiteLLM: the OpenAI-compatible proxy in front of the model providers, and its Admin UI at https://jithendar.com/llm/ui
-# (README "LiteLLM Admin UI"). Two kinds of models:
-#   - config models (litellm_config.yaml below): claude-sonnet-5-5 and claude-haiku-5-5, the names rag-api asks for.
-#     Fixed by this file; the UI lists them but cannot edit or delete them.
-#   - database models: everything added in the Admin UI, kept in PostgreSQL (STORE_MODEL_IN_DB), and moks-cms-default,
-#     which the Job litellm-seed-models creates once. LiteLLM reloads them from the database every 30 s and at once in
-#     the pod that saved a change, so switching one needs no restart and no change here.
-# Never give a database model the name of a config model: LiteLLM would serve both under that name, in turn.
+# (README "LiteLLM Admin UI"). Every model is a database model, kept in PostgreSQL (STORE_MODEL_IN_DB) and edited in
+# the Admin UI; litellm_config.yaml defines none (no model_list). The Job litellm-seed-models creates the names callers
+# depend on when they do not exist yet: claude-sonnet-5-5 and claude-haiku-5-5 (rag-api), moks-cms-default and
+# moks-cms-fast (jithendar.com). LiteLLM reloads database models every 30 s and at once in the pod that saved a change,
+# so switching one needs no restart and no change here.
 #
 # Database: litellm on the shared CloudNativePG cluster (postgres-db/postgres-cluster), through PgBouncer in session
 # mode. k8s-deployments (vars/mk4.tfvars, postgres_databases.litellm) creates the database, its own login role and
@@ -35,17 +33,8 @@ metadata:
     app.kubernetes.io/part-of: rag
 data:
   litellm_config.yaml: |
-    # Config models: rag-api's DEFAULT_LLM_MODEL and FAST_LLM_MODEL. Read-only in the Admin UI.
-    # model_list:
-    #   - model_name: claude-sonnet-5-5
-    #     litellm_params:
-    #       model: anthropic/claude-sonnet-5-5
-    #       api_key: os.environ/ANTHROPIC_API_KEY
-    #   - model_name: claude-haiku-5-5
-    #     litellm_params:
-    #       model: anthropic/claude-haiku-5-5
-    #       api_key: os.environ/ANTHROPIC_API_KEY
-
+    # No model_list: every model lives in the database (Admin UI, and the seed Job litellm-seed-models below). A model
+    # listed here could not be edited or deleted in the UI.
     general_settings:
       master_key: os.environ/LITELLM_MASTER_KEY
       # Models, credentials and virtual keys live in PostgreSQL (DATABASE_URL); the Admin UI edits them there.
@@ -236,11 +225,13 @@ spec:
 # body. Only the first deployment uses them: once a name exists in LiteLLM, the Admin UI owns it and nothing here
 # changes it again, so editing an entry later does not change a live model (edit it in the UI).
 #
+# claude-sonnet-5-5 and claude-haiku-5-5: rag-api's DEFAULT_LLM_MODEL and FAST_LLM_MODEL (rag-api.yaml).
 # moks-cms-default and moks-cms-fast: the stable names moks-cms calls (moks-cms D-109: drafting and crews / classifying,
-# Ask the Blog, enrichment, the Practice tutor). Point either at another model in the Admin UI (README "Switching the
-# model live"); callers keep the name. Its key is a reference (os.environ/ANTHROPIC_API_KEY, resolved from the pod's
-# environment), so no provider key is copied into the database. If the name is deleted in the UI, the next sync of
-# moks-rag-stack creates it again from here: remove the entry first to retire it.
+# Ask the Blog, enrichment, the Practice tutor); the team jithendar.com and its keys may call only these two.
+# Point any of them at another model in the Admin UI (README "Switching the model live"); callers keep the name. Each
+# key is a reference (os.environ/ANTHROPIC_API_KEY, resolved from the pod's environment), so no provider key is copied
+# into the database. If a name is deleted in the UI, the next sync of moks-rag-stack creates it again from here: remove
+# the entry (and move its caller to another name) first to retire it.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -252,6 +243,20 @@ metadata:
 data:
   models.json: |
     [
+      {
+        "model_name": "claude-sonnet-5-5",
+        "litellm_params": {
+          "model": "anthropic/claude-sonnet-5-5",
+          "api_key": "os.environ/ANTHROPIC_API_KEY"
+        }
+      },
+      {
+        "model_name": "claude-haiku-5-5",
+        "litellm_params": {
+          "model": "anthropic/claude-haiku-5-5",
+          "api_key": "os.environ/ANTHROPIC_API_KEY"
+        }
+      },
       {
         "model_name": "moks-cms-default",
         "litellm_params": {
@@ -317,7 +322,13 @@ data:
         with open(os.environ["SEED_FILE"], encoding="utf-8") as f:
             wanted = json.load(f)
         wait_until_ready()
-        existing = {m.get("model_name") for m in call("GET", "/model/info").get("data", [])}
+        # Database models only (model_info.db_model): a pod started with an older litellm_config.yaml may still serve a
+        # config model of the same name until it restarts, and that one disappears then.
+        existing = {
+            m.get("model_name")
+            for m in call("GET", "/model/info").get("data", [])
+            if (m.get("model_info") or {}).get("db_model") is True
+        }
         created = 0
         for model in wanted:
             name = model["model_name"]
