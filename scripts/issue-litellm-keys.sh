@@ -1,18 +1,19 @@
 #!/usr/bin/env bash
 # Create jithendar.com's LiteLLM team and its virtual keys, and write the keys into the site's Secrets (moks-cms D-109,
-# moks-cms docs/LLM_GATEWAY.md; README "LiteLLM as jithendar.com's gateway").
+# D-110, moks-cms docs/LLM_GATEWAY.md; README "LiteLLM as jithendar.com's gateway").
 #
 #   scripts/issue-litellm-keys.sh            # create the team and the keys that are missing
 #   scripts/issue-litellm-keys.sh --rotate   # replace every key (the old ones stop working at once)
 #
-# Team "jithendar.com", models moks-cms-default and moks-cms-fast. One key per caller, each in the Secret that caller
-# reads:
+# Team "jithendar.com", allowed the aliases moks-cms asks for (README table; the models themselves are added by hand in
+# the Admin UI). One key per caller, each in the Secret that caller reads:
 #   jithendar-agent    → jithendar/seo-agent-env       LITELLM_API_KEY           the SEO agent's flows and crews
 #   jithendar-ask      → jithendar/seo-agent-env       LITELLM_ASK_API_KEY       Ask the Blog (readers)
 #   jithendar-web      → jithendar/jithendar-com-env   LITELLM_API_KEY           the web app's drafts and enrichment
 #   jithendar-practice → jithendar/jithendar-com-env   LITELLM_PRACTICE_API_KEY  the Python practice tutor
 # No budget is set (nothing is preset): set the team's and each key's in the Admin UI (https://jithendar.com/llm/ui →
-# Teams / Virtual Keys). A key that exists is kept (its value cannot be read back) unless --rotate is given.
+# Teams / Virtual Keys). A key that exists is kept (its value cannot be read back) unless --rotate is given. A team or
+# key that exists is not changed: the script names the aliases it lacks, to add in the Admin UI.
 # Keys are never printed: they go from LiteLLM's answer to `kubectl patch` through stdin.
 #
 # Uses your current kubectl context (KUBE_CONTEXT=<name> refuses any other) and reaches LiteLLM through a port-forward,
@@ -55,7 +56,9 @@ patches="$(LITELLM_URL="$url" MASTER="$master" ROTATE="$rotate" python3 - <<'PY'
 import json, os, sys, urllib.parse, urllib.request
 
 URL, MASTER, ROTATE = os.environ["LITELLM_URL"].rstrip("/"), os.environ["MASTER"], os.environ["ROTATE"] == "1"
-TEAM, MODELS = "jithendar.com", ["moks-cms-default", "moks-cms-fast"]
+TEAM = "jithendar.com"
+# Every alias moks-cms may ask for (D-110): LITELLM_MODEL, LITELLM_MODEL_FAST, the Opus tier, and AI visibility's.
+MODELS = ["moks-cms-default", "moks-cms-fast", "moks-cms-quality", "moks-cms-visibility-claude", "moks-cms-visibility-chatgpt", "moks-cms-visibility-perplexity", "moks-cms-visibility-gemini"]
 KEYS = [  # alias, Secret, Secret key
     ("jithendar-agent", "seo-agent-env", "LITELLM_API_KEY"),
     ("jithendar-ask", "seo-agent-env", "LITELLM_ASK_API_KEY"),
@@ -80,14 +83,16 @@ if team is None:
     team = call("POST", "/team/new", {"team_alias": TEAM, "models": MODELS, "metadata": {"app": "jithendar.com", "decision": "moks-cms D-109"}})
     print(f"created team {TEAM}", file=sys.stderr)
 else:
-    print(f"team {TEAM} exists", file=sys.stderr)
+    lacks = [m for m in MODELS if (team.get("models") or []) and m not in team["models"]]
+    print(f"team {TEAM} exists" + (f": add {', '.join(lacks)} to its models in the Admin UI (Teams → {TEAM} → Edit)" if lacks else ""), file=sys.stderr)
 team_id = team["team_id"]
 
 patches = {}
 for alias, secret, field in KEYS:
     found = call("GET", "/key/list", query={"key_alias": alias, "return_full_object": "true"}).get("keys") or []
     if found and not ROTATE:
-        print(f"key {alias} exists: kept (--rotate replaces it)", file=sys.stderr)
+        lacks = [m for m in MODELS if (found[0].get("models") or []) and m not in found[0]["models"]]
+        print(f"key {alias} exists: kept (--rotate replaces it)" + (f"; add {', '.join(lacks)} to its models in the Admin UI" if lacks else ""), file=sys.stderr)
         continue
     if found:
         call("POST", "/key/delete", {"key_aliases": [alias]})
