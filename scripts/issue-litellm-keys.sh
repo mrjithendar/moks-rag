@@ -9,7 +9,7 @@
 # the Admin UI). One key per caller, each in the Secret that caller reads:
 #   jithendar-agent    → jithendar/seo-agent-env       LITELLM_API_KEY           the SEO agent's flows and crews
 #   jithendar-ask      → jithendar/seo-agent-env       LITELLM_ASK_API_KEY       Ask the Blog (readers)
-#   jithendar-web      → jithendar/jithendar-com-env   LITELLM_API_KEY           the web app's drafts and enrichment
+#   jithendar-web      → jithendar/jithendar-com-env   LITELLM_API_KEY           the web app's drafts, enrichment, images and video
 #   jithendar-practice → jithendar/jithendar-com-env   LITELLM_PRACTICE_API_KEY  the Python practice tutor
 # No budget is set (nothing is preset): set the team's and each key's in the Admin UI (https://jithendar.com/llm/ui →
 # Teams / Virtual Keys). A key that exists is kept (its value cannot be read back) unless --rotate is given. A team or
@@ -57,8 +57,9 @@ import json, os, sys, urllib.parse, urllib.request
 
 URL, MASTER, ROTATE = os.environ["LITELLM_URL"].rstrip("/"), os.environ["MASTER"], os.environ["ROTATE"] == "1"
 TEAM = "jithendar.com"
-# Every alias moks-cms may ask for (D-110): LITELLM_MODEL, LITELLM_MODEL_FAST, the Opus tier, and AI visibility's.
-MODELS = ["cms-claude-sonnet-latest", "ops-claude-haiku-latest", "moks-cms-quality", "moks-cms-visibility-claude", "moks-cms-visibility-chatgpt", "moks-cms-visibility-perplexity", "moks-cms-visibility-gemini"]
+# Every alias moks-cms may ask for (D-110): LITELLM_MODEL, LITELLM_MODEL_FAST, the Opus tier, AI visibility's, and the
+# image and video models (D-112).
+MODELS = ["cms-claude-sonnet-latest", "ops-claude-haiku-latest", "moks-cms-quality", "moks-cms-visibility-claude", "moks-cms-visibility-chatgpt", "moks-cms-visibility-perplexity", "moks-cms-visibility-gemini", "moks-cms-image", "moks-cms-video"]
 KEYS = [  # alias, Secret, Secret key
     ("jithendar-agent", "seo-agent-env", "LITELLM_API_KEY"),
     ("jithendar-ask", "seo-agent-env", "LITELLM_ASK_API_KEY"),
