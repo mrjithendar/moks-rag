@@ -10,6 +10,11 @@
 # Database: litellm on the shared CloudNativePG cluster (postgres-db/postgres-cluster), through PgBouncer in session
 # mode. k8s-deployments (vars/mk4.tfvars, postgres_databases.litellm) creates the database, its own login role and
 # Secret rag/postgres-db-credentials; nothing here holds a password.
+#
+# Redis: database 8 of the shared Valkey (redis/valkey-master), ACL user litellm, which can open only that database.
+# k8s-deployments (redis_tenants.litellm) writes Secret rag/redis-litellm-credentials. LiteLLM keeps rate-limit and
+# spend counters there (shared by every pod) and broadcasts model changes between pods. Not a response cache:
+# litellm_settings.cache stays off, so prompts and answers are never stored in Valkey.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -125,6 +130,16 @@ spec:
                   key: uri
             - name: STORE_MODEL_IN_DB
               value: "True"
+            # redis://litellm:...@valkey-master.redis.svc.cluster.local:6379/8. Optional on purpose: LiteLLM uses it
+            # when Valkey answers at start-up, and otherwise starts on in-memory counters until its next restart (its
+            # log then says "cross-pod coordination stays in-memory"), so Valkey can never keep LiteLLM from starting.
+            # If Valkey goes away later, requests go on. Without this Secret LiteLLM runs as before, in memory.
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: redis-litellm-credentials
+                  key: uri
+                  optional: true
             # The Admin UI's sign-in (proxy admin). Without UI_PASSWORD LiteLLM would accept the master key as the
             # password, so both are required.
             - name: UI_USERNAME
