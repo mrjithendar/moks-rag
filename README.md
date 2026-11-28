@@ -4,14 +4,14 @@ Production, CPU-only Hybrid RAG platform deployed in the `rag` namespace on Hetz
 
 ## Architecture
 
-All components run in the `rag` namespace and communicate over internal Kubernetes DNS (`*.rag.svc.cluster.local`). Only `rag-api` (`https://jithendar.com/rag`), `open-webui` (`https://jithendar.com/chat`) and Qdrant's REST port with its Web UI (`https://jithendar.com/qdrant`, behind Qdrant's API key, see [Browsing Qdrant](#browsing-qdrant)) are exposed through the Istio ingress gateway (`istio-ingress/public`); every other backend service is strictly `ClusterIP`-only.
+All components run in the `rag` namespace and communicate over internal Kubernetes DNS (`*.rag.svc.cluster.local`). Only `rag-api` (`https://jithendar.com/rag`), `open-webui` (`https://jithendar.com/chat`), Qdrant's REST port with its Web UI (`https://jithendar.com/qdrant`, behind Qdrant's API key, see [Browsing Qdrant](#browsing-qdrant)) and LiteLLM with its Admin UI (`https://jithendar.com/llm`, behind LiteLLM's own keys and sign-in, see [LiteLLM Admin UI](#litellm-admin-ui)) are exposed through the Istio ingress gateway (`istio-ingress/public`); every other backend service is strictly `ClusterIP`-only.
 
 | Component | Image / Chart | Internal Endpoint | Purpose |
 | --- | --- | --- | --- |
 | `bge-m3` | `ollama/ollama:0.40.16` (`bge-m3:567m`) | `http://bge-m3.rag.svc.cluster.local:8001` (and `:11434`) | 1024-dim dense embeddings on ARM64 CPU (migrated from `embeddings` namespace) |
 | `qdrant` | Helm `qdrant/qdrant` chart `1.20.2` (ArgoCD multi-source) | `http://qdrant.rag.svc.cluster.local:6333` | Vector store (`15Gi` PVC; 3 aliases over versioned dense+sparse collections, see [Index versions](#index-versions)) |
 | `docling-serve` | `ghcr.io/docling-project/docling-serve-cpu` 1.39.0, pinned by digest | `http://docling-serve.rag.svc.cluster.local:5001` | Document parsing (PDF/DOCX/HTML -> Markdown via its async API, 2–4Gi RAM); Web UI at `jithendar.com/docling` behind the gateway's login |
-| `litellm` | `ghcr.io/berriai/litellm`, pinned by digest | `http://litellm.rag.svc.cluster.local:4000/v1` | OpenAI-compatible proxy routing `claude-sonnet-5-5` & `claude-haiku-5-5` |
+| `litellm` | `ghcr.io/berriai/litellm` 1.112.0.dev2, pinned by digest | `http://litellm.rag.svc.cluster.local:4000/v1` | OpenAI-compatible proxy: `claude-sonnet-5-5` & `claude-haiku-5-5` (config), `moks-cms-default` and UI-added models (PostgreSQL `litellm` on the shared CloudNativePG cluster); Admin UI at `jithendar.com/llm/ui` |
 | `rag-api` | `ghcr.io/mrjithendar/moks-rag-api:<sha>` | `http://rag-api.rag.svc.cluster.local:8000` (metrics `:9464`) | Custom FastAPI orchestrator (`root_path="/rag"`) |
 | `open-webui` | `ghcr.io/open-webui/open-webui`, pinned by digest | `http://open-webui.rag.svc.cluster.local:80` | Chat UI (`2Gi` PVC) pointing at `rag-api` `/v1` |
 
@@ -56,7 +56,7 @@ moks-rag/
 │   │   ├── namespace.yaml
 │   │   ├── bge-m3.yaml
 │   │   ├── docling-serve.yaml
-│   │   ├── litellm.yaml
+│   │   ├── litellm.yaml         # LiteLLM, its config models, the moks-cms-default seed (PostSync Job)
 │   │   ├── rag-api.yaml
 │   │   ├── open-webui.yaml
 │   │   ├── istio-routing.yaml
@@ -98,6 +98,9 @@ kubectl apply -f deploy/k8s/namespace.yaml
 export ANTHROPIC_API_KEY="sk-ant-..."
 export QDRANT_API_KEY="$(openssl rand -hex 32)"
 export LITELLM_MASTER_KEY="sk-litellm-$(openssl rand -hex 24)"
+export LITELLM_SALT_KEY="sk-$(openssl rand -hex 32)"      # never change it later (LiteLLM Admin UI > Operational warnings)
+export LITELLM_UI_USERNAME="<your admin name, not admin>"
+export LITELLM_UI_PASSWORD="$(openssl rand -hex 24)"
 export RAG_BEARER_TOKEN="$(openssl rand -hex 32)"
 export WEBUI_SECRET_KEY="$(openssl rand -hex 32)"
 
@@ -105,13 +108,17 @@ kubectl -n rag create secret generic rag-secrets \
   --from-literal=ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY}" \
   --from-literal=QDRANT_API_KEY="${QDRANT_API_KEY}" \
   --from-literal=LITELLM_MASTER_KEY="${LITELLM_MASTER_KEY}" \
+  --from-literal=LITELLM_SALT_KEY="${LITELLM_SALT_KEY}" \
+  --from-literal=LITELLM_UI_USERNAME="${LITELLM_UI_USERNAME}" \
+  --from-literal=LITELLM_UI_PASSWORD="${LITELLM_UI_PASSWORD}" \
   --from-literal=RAG_BEARER_TOKEN="${RAG_BEARER_TOKEN}" \
   --from-literal=WEBUI_SECRET_KEY="${WEBUI_SECRET_KEY}" \
   --dry-run=client -o yaml | kubectl apply -f -
 ```
 
 Two optional keys are added later by `scripts/issue-service-token.sh` (see [Access](#access-per-service-tokens)):
-`RAG_SERVICE_TOKENS` (JSON, one token per calling service) and `OPEN_WEBUI_RAG_TOKEN`.
+`RAG_SERVICE_TOKENS` (JSON, one token per calling service) and `OPEN_WEBUI_RAG_TOKEN`. LiteLLM's database URL is not in
+`rag-secrets`: k8s-deployments' Terraform writes Secret `rag/postgres-db-credentials` ([First deployment](#first-deployment)).
 
 **Option B — GitOps with SealedSecrets / External Secrets Operator:**
 
@@ -119,7 +126,7 @@ Two optional keys are added later by `scripts/issue-service-token.sh` (see [Acce
 
 ### 2. Wire `jithendar.com/rag` and `jithendar.com/chat` in the Edge Gateway
 
-In your cluster edge chart (`k8s-deployments/deploy/minikube/istio/edge/values.yaml`), add four delegates under `root.delegates` so the shared `istio-ingress/jithendar-com` root VirtualService delegates `/rag`, `/chat`, `/qdrant` and `/docling`, and a gateway login for `/docling` (see [Browsing docling-serve](#browsing-docling-serve)):
+In your cluster edge chart (`k8s-deployments/deploy/minikube/istio/edge/values.yaml`), add five delegates under `root.delegates` so the shared `istio-ingress/jithendar-com` root VirtualService delegates `/rag`, `/chat`, `/qdrant`, `/docling` and `/llm`, and a gateway login for `/docling` (see [Browsing docling-serve](#browsing-docling-serve)):
 
 ```yaml
 root:
@@ -128,6 +135,7 @@ root:
     - {name: chat, prefix: /chat, to: rag/open-webui} # <-- add
     - {name: qdrant, prefix: /qdrant, to: rag/qdrant} # <-- add
     - {name: docling, prefix: /docling, to: rag/docling-serve} # <-- add
+    - {name: llm, prefix: /llm, to: rag/litellm}     # <-- add
 basicAuth:
   - {name: docling, prefix: /docling, from: rag/docling-ui-auth} # <-- add
 ```
@@ -297,6 +305,143 @@ Mind what the UI can do: a conversion takes up to the pod's 2 CPUs and 4Gi, so a
 How `/docling` works: the `docling-serve` VirtualService in `deploy/k8s/istio-routing.yaml` strips the prefix and sets `Cache-Control: no-store` on everything except the UI's hashed files, so Cloudflare never keeps a converted document; the `docling-serve-ingress` AuthorizationPolicy lets the gateway reach port 5001 only. The UI takes its API address from its own URL (everything before `/ui`), including the status WebSocket, so it needs no patch. `UVICORN_ROOT_PATH=/docling` only fixes the links FastAPI writes (the API docs, the `/ui` redirect); requests still arrive without the prefix, so rag-api's calls are unchanged. CORS is limited to `https://jithendar.com`.
 
 ---
+
+## LiteLLM Admin UI
+
+LiteLLM is at **https://jithendar.com/llm**: the Admin UI at `/llm/ui/` (`/llm` redirects there), Swagger at `/llm/docs` (`/llm/openapi.json`), and the OpenAI-compatible API at `/llm/v1/...`. In the cluster, callers keep using `http://litellm.rag.svc.cluster.local:4000/v1` (no `/llm`).
+
+Models, provider credentials and virtual keys live in PostgreSQL: database `litellm` on the shared CloudNativePG cluster (`postgres-db/postgres-cluster`, through PgBouncer), with its own login role. Changes made in the UI take effect without restarting LiteLLM or its callers.
+
+| Kind of model | Where it is defined | Edit it in |
+| --- | --- | --- |
+| `claude-sonnet-5-5`, `claude-haiku-5-5` (rag-api's `DEFAULT_LLM_MODEL` / `FAST_LLM_MODEL`) | `litellm_config.yaml` in `deploy/k8s/litellm.yaml` | Git (the UI shows them as *Defined in config*, read-only) |
+| `moks-cms-default` | created once by the Job `litellm-seed-models` from `deploy/k8s/litellm.yaml` | the Admin UI |
+| everything you add in the UI | PostgreSQL | the Admin UI |
+
+Never give a UI model the name of a config model: LiteLLM would then serve both under that name, in turn.
+
+### First deployment
+
+Order matters. Each step leaves the running LiteLLM untouched until the last one.
+
+1. **Database** (k8s-deployments): merge the `postgres_databases.litellm = { namespace = "rag" }` entry in `minikube-infrastructure/vars/mk4.tfvars` (with the `/llm` edge delegate). Terraform creates database and role `litellm`, and Secret `rag/postgres-db-credentials`:
+   ```bash
+   kubectl -n postgres-db get database postgres-cluster-litellm          # APPLIED true
+   kubectl -n rag get secret postgres-db-credentials -o jsonpath='{.data}' | python3 -c 'import json,sys; print(sorted(json.load(sys.stdin)))'
+   ```
+2. **Secrets**: add LiteLLM's three new keys to `rag-secrets`. Values go through stdin, never the command line:
+   ```bash
+   read -r -p "LiteLLM admin user name (not 'admin'): " UIUSER
+   SALT="sk-$(openssl rand -hex 32)"; PASS="$(openssl rand -hex 24)"
+   kubectl -n rag patch secret rag-secrets --type merge --patch-file /dev/stdin <<EOF
+   {"stringData": {"LITELLM_SALT_KEY": "$SALT", "LITELLM_UI_USERNAME": "$UIUSER", "LITELLM_UI_PASSWORD": "$PASS"}}
+   EOF
+   unset SALT PASS UIUSER
+   ```
+   Then copy `LITELLM_SALT_KEY` and `LITELLM_UI_PASSWORD` into your password manager (`kubectl -n rag get secret rag-secrets -o jsonpath='{.data.LITELLM_SALT_KEY}' | base64 -d | pbcopy`). The salt key is the only way to read what LiteLLM stores; a database backup is useless without it.
+3. **Merge this repository's change.** The `deploy-argocd-apps` workflow applies the AppProject (it now allows `Job`), and Argo CD rolls LiteLLM: the new pod applies the database migrations (`prisma migrate deploy`, about 260 on an empty database) before serving, while the old pod keeps serving. Then the PostSync hook creates `moks-cms-default`:
+   ```bash
+   kubectl -n rag rollout status deploy/litellm --timeout=10m
+   kubectl -n rag logs job/litellm-seed-models        # moks-cms-default: created -> anthropic/claude-sonnet-5-5
+   ```
+
+Until steps 1 and 2 are done, the new LiteLLM pod waits for its Secret keys (`CreateContainerConfigError`) and the old pod keeps serving rag-api. If Argo CD synced before the workflow applied the AppProject, the sync fails on the Job (`batch:Job is not permitted`) and its retries pick it up a minute later.
+
+### Accessing the Admin UI
+
+Open **https://jithendar.com/llm/ui/** and sign in with `LITELLM_UI_USERNAME` / `LITELLM_UI_PASSWORD` from `rag-secrets` (proxy admin). Read them with `kubectl -n rag get secret rag-secrets -o jsonpath='{.data.LITELLM_UI_PASSWORD}' | base64 -d | pbcopy`. A session lasts 24 hours (`LITELLM_UI_SESSION_DURATION` shortens it).
+
+The red **Environment-credential login is enabled** banner refers to exactly this sign-in. To retire it, create a proxy-admin user with a password in the UI (its users page, `/llm/ui/users/`), sign in as that user, then set `general_settings.disable_env_credential_login: true` in `litellm_config.yaml`. Do it in that order: the other way round nobody can sign in (the master key still works over the API).
+
+The master key (`LITELLM_MASTER_KEY`) is for administration over the API only. Applications get virtual keys.
+
+### Adding a provider and model
+
+1. *Models + Endpoints* → **LLM Credentials**: add one for the provider (pick it, paste its API key, name it, e.g. `openai`). LiteLLM encrypts it with `LITELLM_SALT_KEY` before storing it.
+2. *Models + Endpoints* → **Add Model**: provider, the provider's model (e.g. `openai/gpt-...`), the **public model name** callers will use, and the credential from step 1 (*Existing credentials*), or a key typed in directly.
+3. *Add Model* saves it to PostgreSQL. It is served within seconds (at once by the pod that saved it; the others reload from the database every 30 s).
+4. Test it: the model's page → **Test Connection**, or *Playground*, or over the API with a key allowed that model:
+   ```bash
+   curl -s https://jithendar.com/llm/v1/chat/completions -H "Authorization: Bearer $KEY" \
+     -H 'Content-Type: application/json' -d '{"model":"<public name>","messages":[{"role":"user","content":"ping"}]}'
+   ```
+
+### Creating a virtual key for moks-cms
+
+1. *Virtual Keys* → **Create New Key**. Key name `moks-cms`; **Models**: only `moks-cms-default`. Budget, rate limits (TPM/RPM) and expiry are optional: leave them empty for no limit, or set your own.
+2. **Create Key** shows the key once. Copy it.
+3. Put it in moks-cms's Secret, through stdin:
+   ```bash
+   K="$(pbpaste)"
+   kubectl -n jithendar patch secret jithendar-com-env --type merge --patch-file /dev/stdin <<EOF
+   {"stringData": {"LITELLM_API_KEY": "$K"}}
+   EOF
+   unset K; pbcopy </dev/null
+   ```
+   The site loads `jithendar-com-env` with `envFrom`, so new site pods see `LITELLM_API_KEY`; running pods keep their environment until they are replaced. Today nothing in moks-cms reads it: moks-cms has no LiteLLM client yet. Wiring it means a client in moks-cms calling `http://litellm.rag.svc.cluster.local:4000/v1` with model `moks-cms-default`, and an egress rule to `rag`/`app=litellm` port 4000 in jithendar.com's `kubernetes/30-jithendar-com.yaml` NetworkPolicy. The `litellm-callers` AuthorizationPolicy here already admits namespace `jithendar`.
+
+That key can call `moks-cms-default` and nothing else (another model answers 403). It is not the master key, and must never be: a leaked master key can create keys and change every model and credential.
+
+### Switching the model live
+
+The callers' model name stays `moks-cms-default`; only what it points at changes.
+
+1. Open https://jithendar.com/llm/ui/ → **Models + Endpoints**.
+2. Click the model ID of `moks-cms-default` (its *Model Information* shows the current provider model).
+3. **Edit Settings** → change **LiteLLM Model Name** (e.g. `anthropic/claude-sonnet-5-5` → `anthropic/claude-haiku-5-5`). For another provider, also set its credential with **Re-use Credentials** or **Update API Key**.
+4. **Save** (the UI sends `PATCH /llm/model/<id>/update`; LiteLLM writes PostgreSQL and reloads that model at once).
+5. Check the alias from the API:
+   ```bash
+   curl -s https://jithendar.com/llm/model/info -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
+     | python3 -c 'import json,sys; [print(m["model_name"], "->", m["litellm_params"]["model"]) for m in json.load(sys.stdin)["data"]]'
+   ```
+6. Send a request with the moks-cms virtual key; the response headers name the model that answered:
+   ```bash
+   curl -s -D - -o /dev/null https://jithendar.com/llm/v1/chat/completions -H "Authorization: Bearer $MOKS_CMS_KEY" \
+     -H 'Content-Type: application/json' -d '{"model":"moks-cms-default","messages":[{"role":"user","content":"ping"}]}' \
+     | grep -i -E 'x-litellm-model-(group|name)'
+   # x-litellm-model-name: anthropic/claude-haiku-5-5
+   # x-litellm-model-group: moks-cms-default
+   ```
+7. Every later request uses the new model. Neither LiteLLM nor moks-cms restarts (`kubectl -n rag get pod -l app=litellm` shows the same pod and restart count).
+
+With more than one LiteLLM pod, the others pick the change up from PostgreSQL within 30 s. A sync of `moks-rag-stack` never undoes the switch: the seed Job only creates names that do not exist.
+
+What still needs Git and a restart: the config models (`claude-sonnet-5-5`, `claude-haiku-5-5`), `general_settings` / `litellm_settings` in `litellm_config.yaml`, and the environment (`SERVER_ROOT_PATH`, keys, `UI_PASSWORD`). Retiring `moks-cms-default` for good: remove it from `litellm-seed-models` first, or the next sync creates it again.
+
+### Operational warnings
+
+- **`LITELLM_SALT_KEY` must never change.** It encrypts every model parameter and credential LiteLLM stores. With another salt key LiteLLM starts, but every UI-added model and credential silently disappears (they cannot be decrypted; tried on 1.112.0.dev2: `moks-cms-default` became "Invalid model name"), and the seed Job would create a second `moks-cms-default`. Virtual keys survive (they are hashed, not encrypted). Putting the old salt key back restores everything. Keep a copy outside the cluster; losing it means re-entering every model and credential.
+- **Rotating secrets:** `LITELLM_MASTER_KEY` signs UI sessions and is rag-api's LiteLLM key today, so rotating it signs everyone out and needs rag-api's restart too (`kubectl -n rag rollout restart deploy/litellm deploy/rag-api`). `LITELLM_UI_PASSWORD`: patch the Secret, restart LiteLLM. A virtual key: create a new one with the same models, patch the caller's Secret, then delete the old key. The database password belongs to Terraform (k8s-deployments); LiteLLM reads it at start.
+- **Backups:** the shared cluster has **no backups yet** (`postgres_backups` unset in k8s-deployments: no ScheduledBackup, the replica is not a backup). Until then, dump before upgrades and now and then:
+  ```bash
+  kubectl -n postgres-db exec postgres-cluster-1 -c postgres -- pg_dump -Fc -d litellm > litellm-$(date +%F).dump
+  ```
+  (run it on the current primary: `kubectl -n postgres-db get cluster postgres-cluster -o jsonpath='{.status.currentPrimary}'`). Restore: `kubectl -n rag scale deploy/litellm --replicas=0`, then `kubectl -n postgres-db exec -i <primary> -c postgres -- pg_restore --clean --if-exists --no-owner --role=litellm -d litellm < litellm-<date>.dump`, then scale back to 1. What it restores is only readable with the same `LITELLM_SALT_KEY`.
+- **Storage:** the data sits on the cluster's two 10Gi `local-path` volumes (one per instance, pinned to its node), shared with every tenant. LiteLLM's share is small: no per-request rows (`disable_spend_logs: true`), only models, keys, users and daily spend totals.
+- **Upgrading LiteLLM:** change the image digest. Each start runs `prisma migrate deploy`; the schema only moves forward, so going back to an older image after a migration is not supported: dump first, and roll back by restoring the dump with the old image. During the rolling update the old pod keeps serving on the migrated schema; LiteLLM's default (v2) migration resolver is meant for exactly that overlap. Watch `kubectl -n rag logs deploy/litellm | grep -i migrat`.
+- **Database down = LiteLLM unready.** `/health/readiness` answers 503 while PostgreSQL cannot be reached (virtual keys cannot be checked), so rag-api's answers stop too. LiteLLM's `allow_requests_on_db_unavailable` would keep serving, but would also stop checking keys; it stays off because `/llm` is public. The cluster fails over to its replica on its own.
+- **Memory:** 1.16 GiB working set before the database; requests 1Gi, limit 2Gi. The previous 1.5 GiB limit killed the container when a second process (the prisma CLI) started beside it.
+
+### Shared origin: the UI's session cookie
+
+LiteLLM keeps the UI session in a cookie named `token`, on path `/` of jithendar.com, readable by JavaScript (the UI reads it, so it cannot be HttpOnly). It is a signed JWT that **contains a proxy-admin API key**, valid for the session (24 h). jithendar.com is one origin for the site and every admin tool, so any script running on any jithendar.com page, including the site's third-party scripts, can read it while you are signed in. Also, Open WebUI (`/chat`) uses a cookie of the same name and path: signing in to one replaces the other's.
+
+Until the UI moves to its own host name (e.g. `llm.jithendar.com`, the lasting fix), sign out of the LiteLLM UI when done, use a private window for it, or shorten sessions with `LITELLM_UI_SESSION_DURATION`. Cloudflare Access (edge `cloudflare.access.prefixes` lists `/llm`) guards who reaches `/llm`, not the cookie.
+
+### Troubleshooting
+
+| Symptom | Check |
+| --- | --- |
+| Pod `CreateContainerConfigError` | `kubectl -n rag describe pod -l app=litellm`: Secret `postgres-db-credentials` (k8s-deployments not applied) or a `rag-secrets` key missing |
+| Pod not Ready, `/health/readiness` 503 `"db":"disconnected"` | `kubectl -n postgres-db get cluster,pooler`; `kubectl -n postgres-db get database postgres-cluster-litellm`; LiteLLM's log for `P1001` (cannot reach) or `P1000` (password) |
+| Start-up exits after "Database migration cannot proceed" | `kubectl -n rag logs deploy/litellm --previous`; usually permissions: the role must own database `litellm` |
+| Sign-in says invalid credentials | the values in `rag-secrets` (`LITELLM_UI_USERNAME`/`PASSWORD`) as of the pod's start: patching the Secret needs `kubectl -n rag rollout restart deploy/litellm`. Repeated failures block that user name for a while (HTTP 429) |
+| UI blank, or `/llm/ui/` shows the site's 404 | `curl -sI https://jithendar.com/llm/ui/` must carry `cache-control: no-store, no-transform` (set by the `litellm` VirtualService); if not, the edge delegate `llm` (k8s-deployments) is missing. LiteLLM's log must not say `Cannot apply server_root_path replacements` |
+| A model added in the UI is missing | `kubectl -n rag logs deploy/litellm | grep -i decrypt` (salt key changed?); a name equal to a config model? |
+| Seed Job failed | `kubectl -n rag logs job/litellm-seed-models` |
+
+How `/llm` works: the `litellm` VirtualService in `deploy/k8s/istio-routing.yaml` keeps the prefix (LiteLLM runs with `SERVER_ROOT_PATH=/llm` and rewrites its UI files for it at start-up), redirects `/llm`, `/llm/` and `/llm/ui` to `/llm/ui/`, and sets `Cache-Control: no-store` on everything except the UI's hashed files under `/llm/_next/static/`. It matches only `/llm` and `/llm/...`, so the site keeps `/llms.txt`. `PROXY_BASE_URL=https://jithendar.com/llm` gives the UI its API base; `FORWARDED_ALLOW_IPS=127.0.0.6` (the sidecar) lets LiteLLM's own redirects say `https://`. The `litellm-callers` AuthorizationPolicy admits the gateway and namespace `jithendar` on port 4000. Two of the UI's requests leave `/llm` and get the site's 404 (`/get_favicon`, `/ui/litellm-runtime-config.json`); the UI does not need them.
 
 ## Indexing the GitHub repositories
 
