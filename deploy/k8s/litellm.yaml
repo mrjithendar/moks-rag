@@ -39,9 +39,14 @@ data:
       master_key: os.environ/LITELLM_MASTER_KEY
       # Models, credentials and virtual keys live in PostgreSQL (DATABASE_URL); the Admin UI edits them there.
       store_model_in_db: true
-      # Only proxy admins may use the UI when single sign-on is added later (today only UI_USERNAME can sign in:
-      # LiteLLM creates no other UI logins by itself).
+      # Only proxy admins may use the UI when single sign-on is added later (this setting applies to single sign-on
+      # only; a user signing in with a password gets the role set on their UI user).
       ui_access_mode: admin_only
+      # No sign-in with UI_USERNAME/UI_PASSWORD (or the master key): a shared static secret that makes whoever holds
+      # it a proxy admin. The Admin UI then takes only its own users, by email and password (README "Accessing the
+      # Admin UI"): turn this on only while such a proxy-admin user can sign in. The master key still works over the
+      # API, so a lost password can be reset with it (README, same section).
+      disable_env_credential_login: true
       # No per-request rows (prompt metadata, tokens, cost) in the database; keys' spend totals are still counted, so
       # budgets on virtual keys still work.
       disable_spend_logs: true
@@ -70,6 +75,11 @@ spec:
       labels:
         app: litellm
         app.kubernetes.io/part-of: rag
+      annotations:
+        # LiteLLM reads litellm_config.yaml only at start, and a ConfigMap change alone restarts nothing. Change this
+        # value in the same commit as the ConfigMap above: Argo CD then rolls LiteLLM once, by itself, instead of
+        # someone running `kubectl rollout restart` (README "LiteLLM Admin UI" > "Operational warnings" > Memory).
+        rag.jithendar.com/litellm-config: "2026-11-28-disable-env-credential-login"
     spec:
       serviceAccountName: litellm
       automountServiceAccountToken: false
@@ -129,8 +139,9 @@ spec:
                   name: redis-litellm-credentials
                   key: uri
                   optional: true
-            # The Admin UI's sign-in (proxy admin). Without UI_PASSWORD LiteLLM would accept the master key as the
-            # password, so both are required.
+            # The environment sign-in, switched off by general_settings.disable_env_credential_login above. Kept set so
+            # that, should that setting ever be removed, the password is UI_PASSWORD and not the master key (LiteLLM's
+            # fallback when UI_PASSWORD is unset).
             - name: UI_USERNAME
               valueFrom:
                 secretKeyRef:
