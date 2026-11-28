@@ -317,7 +317,9 @@ Every model is added by hand in the Admin UI (**Models + Endpoints → Add Model
 | Public model name | Caller | Set in |
 | --- | --- | --- |
 | `claude-sonnet-5-5`, `claude-haiku-5-5` | rag-api (`DEFAULT_LLM_MODEL` / `FAST_LLM_MODEL`) | `deploy/k8s/rag-api.yaml` |
-| `moks-cms-default`, `moks-cms-fast` | jithendar.com (team `jithendar.com`, below) | moks-cms `LITELLM_MODEL_DEFAULT` / `LITELLM_MODEL_FAST`, and the team's allowed models |
+| `moks-cms-default`, `moks-cms-fast` | jithendar.com (team `jithendar.com`, below) | moks-cms `LITELLM_MODEL` / `LITELLM_MODEL_FAST`, and the team's allowed models |
+| `moks-cms-quality` | jithendar.com: crews the site gives the Opus tier (`SEO_CREW_MODELS`), and every Opus id moks-cms had stored (its migration 0045) | jithendar.com `kubernetes/seo-agent-40-seo-agent.yaml` |
+| `moks-cms-visibility-claude`, `-chatgpt`, `-perplexity`, `-gemini` | jithendar.com's AI visibility, only for the assistants switched on: each must point at that assistant's model with web search | moks-cms Settings → AI & drafts → AI visibility |
 
 To use other names, change the caller's setting (and the team's models) first. Never give two models the same name: LiteLLM would serve both under that name, in turn.
 
@@ -366,13 +368,15 @@ The master key (`LITELLM_MASTER_KEY`) is for administration over the API only. A
      -H 'Content-Type: application/json' -d '{"model":"<public name>","messages":[{"role":"user","content":"ping"}]}'
    ```
 
-### LiteLLM as jithendar.com's gateway (moks-cms D-109)
+### LiteLLM as jithendar.com's gateway (moks-cms D-109, D-110)
 
-Every text model call of jithendar.com goes through LiteLLM (moks-cms `docs/LLM_GATEWAY.md`). These are the SEO agent's
-flows and crews, Ask the Blog, the web app's drafts and enrichment, and the Python practice tutor. moks-cms asks for two
-aliases, `moks-cms-default` (drafting, crews) and `moks-cms-fast` (classifying, Ask the Blog, enrichment, the tutor);
-add both in the Admin UI (above). The budgets are LiteLLM's: the team `jithendar.com` and one virtual key
-per caller.
+Every model call of jithendar.com goes through LiteLLM, the only gateway since moks-cms D-110 (moks-cms
+`docs/LLM_GATEWAY.md`): the SEO agent's flows and crews, Ask the Blog, the web app's drafts, enrichment and AI visibility,
+and the Python practice tutor. moks-cms keeps no provider, model, key or budget of its own, and calls no model without
+LiteLLM. It asks for the aliases in the table above: `moks-cms-default` (drafting, crews), `moks-cms-fast`
+(classifying, Ask the Blog, enrichment, the tutor), `moks-cms-quality` (the Opus tier), and the AI visibility ones that
+are switched on. Add them in the Admin UI (above) before the moks-cms release with D-110. The budgets are LiteLLM's: the
+team `jithendar.com` and one virtual key per caller.
 
 1. **Keys.** Create the team and the keys, and write them into the site's Secrets:
    ```bash
@@ -385,7 +389,8 @@ per caller.
    | `jithendar-web` | `jithendar-com-env` `LITELLM_API_KEY` | the web app's drafts, keyword intents, enrichment |
    | `jithendar-practice` | `jithendar-com-env` `LITELLM_PRACTICE_API_KEY` | the Python practice tutor |
 
-   Each key may use only the two aliases. The script never prints a key. It keeps a key that exists (its value cannot be
+   The team and each key may use only moks-cms's aliases (the table above). For a team or key that exists, the script
+   names the aliases it lacks instead of changing it: add them in the Admin UI (Teams / Virtual Keys → Edit). The script never prints a key. It keeps a key that exists (its value cannot be
    read back), and `--rotate` replaces every key: the old ones stop working at once.
 2. **Wiring** (jithendar.com). The manifests set `LITELLM_BASE_URL=http://litellm.rag.svc.cluster.local:4000/v1` on
    both containers, and the NetworkPolicy allows egress to `rag`/`app=litellm` port 4000. The `litellm-callers`
@@ -395,9 +400,9 @@ per caller.
    example per 30 days). *Virtual Keys* take one per caller: Ask the Blog's at least, since readers start it. Rate
    limits (RPM/TPM) are optional. Nothing is preset: empty is no limit. A call over a budget is refused with HTTP 422
    `budget_exceeded`, and moks-cms pauses the flow or shows the reader that the assistant is unavailable.
-4. **Check.** Settings → AI & models → LLM providers & budget on the site shows LiteLLM's view, read with the keys:
-   the team, each key's spend, budget and reset, and what each alias points at. The SEO agent logs
-   `llm gateway: litellm` at start.
+4. **Check.** Settings → AI & models → LiteLLM on the site shows, for the web app and for the SEO agent, whether each
+   reaches LiteLLM and which aliases it lacks, then the team's and each key's spend, budget and reset, read with the
+   keys.
 
 A key is not the master key, and must never be: a leaked master key can create keys and change every model and
 credential.
