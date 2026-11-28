@@ -320,6 +320,7 @@ Every model is added by hand in the Admin UI (**Models + Endpoints → Add Model
 | `cms-claude-sonnet-latest`, `ops-claude-haiku-latest` | jithendar.com (team `jithendar.com`, below) | moks-cms `LITELLM_MODEL` / `LITELLM_MODEL_FAST`, and the team's allowed models |
 | `moks-cms-quality` | jithendar.com: crews the site gives the Opus tier (`SEO_CREW_MODELS`), and every Opus id moks-cms had stored (its migration 0045) | jithendar.com `kubernetes/seo-agent-40-seo-agent.yaml` |
 | `moks-cms-visibility-claude`, `-chatgpt`, `-perplexity`, `-gemini` | jithendar.com's AI visibility, only for the assistants switched on: each must point at that assistant's model with web search | moks-cms Settings → AI & drafts → AI visibility |
+| `moks-cms-image`, `moks-cms-video` | jithendar.com's image and video generation (moks-cms D-112, docs/MEDIA_GENERATION.md): an `image_generation` and a `video_generation` model; video only if wanted | moks-cms `LITELLM_MODEL_IMAGE` / `LITELLM_MODEL_VIDEO`, and the team's and `jithendar-web` key's allowed models |
 
 To use other names, change the caller's setting (and the team's models) first. Never give two models the same name: LiteLLM would serve both under that name, in turn.
 
@@ -416,7 +417,7 @@ team `jithendar.com` and one virtual key per caller.
    |---|---|---|
    | `jithendar-agent` | `seo-agent-env` `LITELLM_API_KEY` | the SEO agent's flows and crews |
    | `jithendar-ask` | `seo-agent-env` `LITELLM_ASK_API_KEY` | Ask the Blog (readers) |
-   | `jithendar-web` | `jithendar-com-env` `LITELLM_API_KEY` | the web app's drafts, keyword intents, enrichment |
+   | `jithendar-web` | `jithendar-com-env` `LITELLM_API_KEY` | the web app's drafts, keyword intents, enrichment, image and video generation |
    | `jithendar-practice` | `jithendar-com-env` `LITELLM_PRACTICE_API_KEY` | the Python practice tutor |
 
    The team and each key may use only moks-cms's aliases (the table above). For a team or key that exists, the script
