@@ -36,15 +36,15 @@ metadata:
 data:
   litellm_config.yaml: |
     # Config models: rag-api's DEFAULT_LLM_MODEL and FAST_LLM_MODEL. Read-only in the Admin UI.
-    model_list:
-      - model_name: claude-sonnet-5-5
-        litellm_params:
-          model: anthropic/claude-sonnet-5-5
-          api_key: os.environ/ANTHROPIC_API_KEY
-      - model_name: claude-haiku-5-5
-        litellm_params:
-          model: anthropic/claude-haiku-5-5
-          api_key: os.environ/ANTHROPIC_API_KEY
+    # model_list:
+    #   - model_name: claude-sonnet-5-5
+    #     litellm_params:
+    #       model: anthropic/claude-sonnet-5-5
+    #       api_key: os.environ/ANTHROPIC_API_KEY
+    #   - model_name: claude-haiku-5-5
+    #     litellm_params:
+    #       model: anthropic/claude-haiku-5-5
+    #       api_key: os.environ/ANTHROPIC_API_KEY
 
     general_settings:
       master_key: os.environ/LITELLM_MASTER_KEY
