@@ -1,9 +1,9 @@
 # LiteLLM: the OpenAI-compatible proxy in front of the model providers, and its Admin UI at https://jithendar.com/llm/ui
-# (README "LiteLLM Admin UI"). Every model is a database model, kept in PostgreSQL (STORE_MODEL_IN_DB) and edited in
-# the Admin UI; litellm_config.yaml defines none (no model_list). The Job litellm-seed-models creates the names callers
-# depend on when they do not exist yet: claude-sonnet-5-5 and claude-haiku-5-5 (rag-api), moks-cms-default and
-# moks-cms-fast (jithendar.com). LiteLLM reloads database models every 30 s and at once in the pod that saved a change,
-# so switching one needs no restart and no change here.
+# (README "LiteLLM Admin UI"). Every model is added by hand in the Admin UI and kept in PostgreSQL (STORE_MODEL_IN_DB);
+# nothing in Git defines or creates one (litellm_config.yaml has no model_list). The callers' names must exist there:
+# claude-sonnet-5-5 and claude-haiku-5-5 (rag-api.yaml), moks-cms-default and moks-cms-fast (jithendar.com's team).
+# LiteLLM reloads database models every 30 s and at once in the pod that saved a change, so switching one needs no
+# restart and no change here.
 #
 # Database: litellm on the shared CloudNativePG cluster (postgres-db/postgres-cluster), through PgBouncer in session
 # mode. k8s-deployments (vars/mk4.tfvars, postgres_databases.litellm) creates the database, its own login role and
@@ -33,8 +33,8 @@ metadata:
     app.kubernetes.io/part-of: rag
 data:
   litellm_config.yaml: |
-    # No model_list: every model lives in the database (Admin UI, and the seed Job litellm-seed-models below). A model
-    # listed here could not be edited or deleted in the UI.
+    # No model_list: every model is added in the Admin UI and lives in the database. A model listed here could not be
+    # edited or deleted in the UI.
     general_settings:
       master_key: os.environ/LITELLM_MASTER_KEY
       # Models, credentials and virtual keys live in PostgreSQL (DATABASE_URL); the Admin UI edits them there.
@@ -220,202 +220,3 @@ spec:
       port: 4000
       targetPort: http
       appProtocol: http
----
-# Database models to create when they do not exist yet (Job litellm-seed-models below). Each entry is a /model/new
-# body. Only the first deployment uses them: once a name exists in LiteLLM, the Admin UI owns it and nothing here
-# changes it again, so editing an entry later does not change a live model (edit it in the UI).
-#
-# claude-sonnet-5-5 and claude-haiku-5-5: rag-api's DEFAULT_LLM_MODEL and FAST_LLM_MODEL (rag-api.yaml).
-# moks-cms-default and moks-cms-fast: the stable names moks-cms calls (moks-cms D-109: drafting and crews / classifying,
-# Ask the Blog, enrichment, the Practice tutor); the team jithendar.com and its keys may call only these two.
-# Point any of them at another model in the Admin UI (README "Switching the model live"); callers keep the name. Each
-# key is a reference (os.environ/ANTHROPIC_API_KEY, resolved from the pod's environment), so no provider key is copied
-# into the database. If a name is deleted in the UI, the next sync of moks-rag-stack creates it again from here: remove
-# the entry (and move its caller to another name) first to retire it.
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: litellm-seed-models
-  namespace: rag
-  labels:
-    app: litellm-seed-models
-    app.kubernetes.io/part-of: rag
-data:
-  models.json: |
-    [
-      {
-        "model_name": "claude-sonnet-5-5",
-        "litellm_params": {
-          "model": "anthropic/claude-sonnet-5-5",
-          "api_key": "os.environ/ANTHROPIC_API_KEY"
-        }
-      },
-      {
-        "model_name": "claude-haiku-5-5",
-        "litellm_params": {
-          "model": "anthropic/claude-haiku-5-5",
-          "api_key": "os.environ/ANTHROPIC_API_KEY"
-        }
-      },
-      {
-        "model_name": "moks-cms-default",
-        "litellm_params": {
-          "model": "anthropic/claude-sonnet-5-5",
-          "api_key": "os.environ/ANTHROPIC_API_KEY"
-        }
-      },
-      {
-        "model_name": "moks-cms-fast",
-        "litellm_params": {
-          "model": "anthropic/claude-haiku-5-5",
-          "api_key": "os.environ/ANTHROPIC_API_KEY"
-        }
-      }
-    ]
-  seed_models.py: |
-    """Create the database models in models.json that LiteLLM does not have yet; never change one that exists.
-
-    Reads LITELLM_URL, LITELLM_MASTER_KEY and SEED_FILE. Prints model names and ids only, never parameters or keys.
-    """
-    import json
-    import os
-    import sys
-    import time
-    import urllib.error
-    import urllib.request
-
-    BASE = os.environ["LITELLM_URL"].rstrip("/")
-    KEY = os.environ["LITELLM_MASTER_KEY"]
-    WAIT_SECONDS = 600
-
-
-    def call(method, path, body=None):
-        request = urllib.request.Request(
-            BASE + path,
-            method=method,
-            data=None if body is None else json.dumps(body).encode(),
-            headers={"Authorization": f"Bearer {KEY}", "Content-Type": "application/json"},
-        )
-        with urllib.request.urlopen(request, timeout=60) as response:
-            return json.loads(response.read() or b"null")
-
-
-    def wait_until_ready():
-        """LiteLLM answering with its database connected (the Sync phase already waited for the pod)."""
-        deadline = time.monotonic() + WAIT_SECONDS
-        while True:
-            try:
-                with urllib.request.urlopen(BASE + "/health/readiness", timeout=10) as response:
-                    db = json.loads(response.read()).get("db")
-                if db == "connected":
-                    return
-                problem = f"its database is {db!r}"
-            except (urllib.error.URLError, OSError, ValueError) as error:
-                problem = str(error)
-            if time.monotonic() > deadline:
-                sys.exit(f"LiteLLM was not ready with its database within {WAIT_SECONDS} s: {problem}")
-            print(f"waiting for LiteLLM: {problem}", flush=True)
-            time.sleep(5)
-
-
-    def main():
-        with open(os.environ["SEED_FILE"], encoding="utf-8") as f:
-            wanted = json.load(f)
-        wait_until_ready()
-        # Database models only (model_info.db_model): a pod started with an older litellm_config.yaml may still serve a
-        # config model of the same name until it restarts, and that one disappears then.
-        existing = {
-            m.get("model_name")
-            for m in call("GET", "/model/info").get("data", [])
-            if (m.get("model_info") or {}).get("db_model") is True
-        }
-        created = 0
-        for model in wanted:
-            name = model["model_name"]
-            if name in existing:
-                print(f"{name}: exists, left as it is (the Admin UI owns it)", flush=True)
-                continue
-            try:
-                result = call("POST", "/model/new", model)
-            except urllib.error.HTTPError as error:
-                sys.exit(f"{name}: LiteLLM refused /model/new with HTTP {error.code}: {error.read()[:500]!r}")
-            model_id = (result or {}).get("model_id") or (result or {}).get("model_info", {}).get("id")
-            print(f"{name}: created -> {model['litellm_params']['model']} (id {model_id})", flush=True)
-            created += 1
-        print(f"done: {created} created, {len(wanted) - created} already there", flush=True)
-
-
-    if __name__ == "__main__":
-        main()
----
-# Creates the database models above that LiteLLM does not have yet, after every sync of moks-rag-stack (Argo CD
-# PostSync hook: it runs once LiteLLM is healthy, i.e. connected to its database). Idempotent: a model that exists is
-# never touched, so a sync never undoes a change made in the Admin UI. The previous run stays until the next sync
-# (BeforeHookCreation), so its log can be read:
-#   kubectl -n rag logs job/litellm-seed-models
-# Runs rag-api's image (Python, already on the nodes) with the script from the ConfigMap; the Istio sidecar gives it
-# the mesh's mTLS to LiteLLM (AuthorizationPolicy rag-internal-services admits namespace rag).
-apiVersion: batch/v1
-kind: Job
-metadata:
-  name: litellm-seed-models
-  namespace: rag
-  labels:
-    app: litellm-seed-models
-    app.kubernetes.io/part-of: rag
-  annotations:
-    argocd.argoproj.io/hook: PostSync
-    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
-spec:
-  backoffLimit: 2
-  activeDeadlineSeconds: 900
-  template:
-    metadata:
-      labels:
-        app: litellm-seed-models
-        app.kubernetes.io/part-of: rag
-    spec:
-      serviceAccountName: litellm
-      automountServiceAccountToken: false
-      enableServiceLinks: false
-      restartPolicy: Never
-      securityContext:
-        runAsNonRoot: true
-        runAsUser: 1000
-        runAsGroup: 1000
-        seccompProfile:
-          type: RuntimeDefault
-      containers:
-        - name: seed
-          image: ghcr.io/mrjithendar/moks-rag-api:latest
-          imagePullPolicy: IfNotPresent
-          command: ["python", "-I", "/seed/seed_models.py"]
-          env:
-            - name: LITELLM_URL
-              value: "http://litellm.rag.svc.cluster.local:4000"
-            - name: SEED_FILE
-              value: /seed/models.json
-            - name: LITELLM_MASTER_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: rag-secrets
-                  key: LITELLM_MASTER_KEY
-          resources:
-            requests:
-              cpu: 10m
-              memory: 32Mi
-            limits:
-              memory: 128Mi
-          securityContext:
-            allowPrivilegeEscalation: false
-            readOnlyRootFilesystem: true
-            capabilities:
-              drop: ["ALL"]
-          volumeMounts:
-            - name: seed
-              mountPath: /seed
-              readOnly: true
-      volumes:
-        - name: seed
-          configMap:
-            name: litellm-seed-models

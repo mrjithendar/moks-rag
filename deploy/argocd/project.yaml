@@ -33,9 +33,6 @@ spec:
       kind: StatefulSet
     - group: batch
       kind: CronJob
-    # The PostSync hook litellm-seed-models (deploy/k8s/litellm.yaml).
-    - group: batch
-      kind: Job
     - group: networking.k8s.io
       kind: NetworkPolicy
     - group: policy
