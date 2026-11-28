@@ -1,3 +1,15 @@
+# LiteLLM: the OpenAI-compatible proxy in front of the model providers, and its Admin UI at https://jithendar.com/llm/ui
+# (README "LiteLLM Admin UI"). Two kinds of models:
+#   - config models (litellm_config.yaml below): claude-sonnet-5-5 and claude-haiku-5-5, the names rag-api asks for.
+#     Fixed by this file; the UI lists them but cannot edit or delete them.
+#   - database models: everything added in the Admin UI, kept in PostgreSQL (STORE_MODEL_IN_DB), and moks-cms-default,
+#     which the Job litellm-seed-models creates once. LiteLLM reloads them from the database every 30 s and at once in
+#     the pod that saved a change, so switching one needs no restart and no change here.
+# Never give a database model the name of a config model: LiteLLM would serve both under that name, in turn.
+#
+# Database: litellm on the shared CloudNativePG cluster (postgres-db/postgres-cluster), through PgBouncer in session
+# mode. k8s-deployments (vars/mk4.tfvars, postgres_databases.litellm) creates the database, its own login role and
+# Secret rag/postgres-db-credentials; nothing here holds a password.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -18,6 +30,7 @@ metadata:
     app.kubernetes.io/part-of: rag
 data:
   litellm_config.yaml: |
+    # Config models: rag-api's DEFAULT_LLM_MODEL and FAST_LLM_MODEL. Read-only in the Admin UI.
     model_list:
       - model_name: claude-sonnet-5-5
         litellm_params:
@@ -30,6 +43,13 @@ data:
 
     general_settings:
       master_key: os.environ/LITELLM_MASTER_KEY
+      # Models, credentials and virtual keys live in PostgreSQL (DATABASE_URL); the Admin UI edits them there.
+      store_model_in_db: true
+      # Only proxy admins may use the UI when single sign-on is added later (today only UI_USERNAME can sign in:
+      # LiteLLM creates no other UI logins by itself).
+      ui_access_mode: admin_only
+      # No per-request rows (prompt metadata, tokens, cost) in the database; keys' spend totals are still counted, so
+      # budgets on virtual keys still work.
       disable_spend_logs: true
 
     litellm_settings:
@@ -62,10 +82,13 @@ spec:
       enableServiceLinks: false
       containers:
         - name: litellm
-          # Pinned to the digest mk4 ran on 2026-11-26 (multi-arch index). To upgrade: pick a release tag, take its
-          # digest, change both here, and watch litellm's /health/readiness after the sync.
+          # Pinned to the digest mk4 ran on 2026-11-26 (LiteLLM 1.112.0.dev2, multi-arch index). To upgrade: pick a
+          # release tag, take its digest, change it here, and read README "LiteLLM Admin UI" > "Operational warnings"
+          # first (the database schema only moves forward).
           image: ghcr.io/berriai/litellm:main-latest@sha256:a6306e48c148a33b564a0837a987a5d7f37b976b1562b16b8f4accd3b08db26a
           imagePullPolicy: IfNotPresent
+          # The image's entrypoint runs the proxy. With DATABASE_URL set it applies the database migrations
+          # (`prisma migrate deploy`) before it starts serving, on every start; nothing happens when there are none.
           args:
             - "--config"
             - "/app/config/litellm_config.yaml"
@@ -84,9 +107,55 @@ spec:
                 secretKeyRef:
                   name: rag-secrets
                   key: LITELLM_MASTER_KEY
+            # Encrypts what LiteLLM stores in PostgreSQL: provider API keys and credentials added in the UI, model
+            # parameters. Required (not optional): without it LiteLLM would encrypt with the master key, and setting
+            # a salt key later would leave everything stored until then unreadable. NEVER change it once LiteLLM has
+            # written to the database (README "LiteLLM Admin UI" > "Operational warnings").
+            - name: LITELLM_SALT_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: rag-secrets
+                  key: LITELLM_SALT_KEY
+            # postgresql://litellm:...@postgres-cluster-pooler-rw.postgres-db.svc.cluster.local:5432/litellm, written
+            # by k8s-deployments' Terraform. The pod waits for this Secret, so an apply there goes first.
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-db-credentials
+                  key: uri
+            - name: STORE_MODEL_IN_DB
+              value: "True"
+            # The Admin UI's sign-in (proxy admin). Without UI_PASSWORD LiteLLM would accept the master key as the
+            # password, so both are required.
+            - name: UI_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: rag-secrets
+                  key: LITELLM_UI_USERNAME
+            - name: UI_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: rag-secrets
+                  key: LITELLM_UI_PASSWORD
+            # Served under https://jithendar.com/llm. The gateway keeps the prefix (istio-routing.yaml, VirtualService
+            # litellm); LiteLLM strips it before routing, so in-cluster callers keep using
+            # http://litellm.rag.svc.cluster.local:4000/v1 without it.
+            - name: SERVER_ROOT_PATH
+              value: "/llm"
+            # The public address: the UI's API base and the Secure flag on the UI's session cookie come from it.
+            - name: PROXY_BASE_URL
+              value: "https://jithendar.com/llm"
+            # Swagger at /llm/docs (LiteLLM's default is the root, which the gateway sends to the UI).
+            - name: DOCS_URL
+              value: "/docs"
+            # The pod's Istio sidecar connects from 127.0.0.6: trust its X-Forwarded-Proto/-For, so redirects
+            # LiteLLM builds itself (a UI page without its trailing slash) say https://, not http://.
+            - name: FORWARDED_ALLOW_IPS
+              value: "127.0.0.6"
           ports:
             - name: http
               containerPort: 4000
+          # The first start on an empty database applies every migration: allow it 5 minutes.
           startupProbe:
             httpGet:
               path: /health/readiness
@@ -94,7 +163,9 @@ spec:
             initialDelaySeconds: 5
             periodSeconds: 5
             timeoutSeconds: 5
-            failureThreshold: 30
+            failureThreshold: 60
+          # 503 while the database cannot be reached (keys cannot be checked then), which takes this pod out of the
+          # Service but does not restart it.
           readinessProbe:
             httpGet:
               path: /health/readiness
@@ -109,13 +180,16 @@ spec:
             periodSeconds: 20
             timeoutSeconds: 5
             failureThreshold: 5
+          # Measured on mk4 2026-11-28 without a database: 1.16 GiB working set, 1.30 GiB in the cgroup, and one
+          # extra process (the prisma CLI) was enough to be killed at the old 1.5 GiB limit. With a database the
+          # proxy also runs the prisma CLI at every start (migrations) and keeps Prisma's query engine running.
           resources:
             requests:
               cpu: 100m
-              memory: 384Mi
+              memory: 1Gi
             limits:
               cpu: "1"
-              memory: 1536Mi
+              memory: 2Gi
           volumeMounts:
             - name: config
               mountPath: /app/config
@@ -142,3 +216,172 @@ spec:
       port: 4000
       targetPort: http
       appProtocol: http
+---
+# Database models to create when they do not exist yet (Job litellm-seed-models below). Each entry is a /model/new
+# body. Only the first deployment uses them: once a name exists in LiteLLM, the Admin UI owns it and nothing here
+# changes it again, so editing an entry later does not change a live model (edit it in the UI).
+#
+# moks-cms-default: the stable name moks-cms calls. Point it at another model in the Admin UI (README "Switching the
+# model live"); callers keep the name. Its key is a reference (os.environ/ANTHROPIC_API_KEY, resolved from the pod's
+# environment), so no provider key is copied into the database. If the name is deleted in the UI, the next sync of
+# moks-rag-stack creates it again from here: remove the entry first to retire it.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: litellm-seed-models
+  namespace: rag
+  labels:
+    app: litellm-seed-models
+    app.kubernetes.io/part-of: rag
+data:
+  models.json: |
+    [
+      {
+        "model_name": "moks-cms-default",
+        "litellm_params": {
+          "model": "anthropic/claude-sonnet-5-5",
+          "api_key": "os.environ/ANTHROPIC_API_KEY"
+        }
+      }
+    ]
+  seed_models.py: |
+    """Create the database models in models.json that LiteLLM does not have yet; never change one that exists.
+
+    Reads LITELLM_URL, LITELLM_MASTER_KEY and SEED_FILE. Prints model names and ids only, never parameters or keys.
+    """
+    import json
+    import os
+    import sys
+    import time
+    import urllib.error
+    import urllib.request
+
+    BASE = os.environ["LITELLM_URL"].rstrip("/")
+    KEY = os.environ["LITELLM_MASTER_KEY"]
+    WAIT_SECONDS = 600
+
+
+    def call(method, path, body=None):
+        request = urllib.request.Request(
+            BASE + path,
+            method=method,
+            data=None if body is None else json.dumps(body).encode(),
+            headers={"Authorization": f"Bearer {KEY}", "Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(request, timeout=60) as response:
+            return json.loads(response.read() or b"null")
+
+
+    def wait_until_ready():
+        """LiteLLM answering with its database connected (the Sync phase already waited for the pod)."""
+        deadline = time.monotonic() + WAIT_SECONDS
+        while True:
+            try:
+                with urllib.request.urlopen(BASE + "/health/readiness", timeout=10) as response:
+                    db = json.loads(response.read()).get("db")
+                if db == "connected":
+                    return
+                problem = f"its database is {db!r}"
+            except (urllib.error.URLError, OSError, ValueError) as error:
+                problem = str(error)
+            if time.monotonic() > deadline:
+                sys.exit(f"LiteLLM was not ready with its database within {WAIT_SECONDS} s: {problem}")
+            print(f"waiting for LiteLLM: {problem}", flush=True)
+            time.sleep(5)
+
+
+    def main():
+        with open(os.environ["SEED_FILE"], encoding="utf-8") as f:
+            wanted = json.load(f)
+        wait_until_ready()
+        existing = {m.get("model_name") for m in call("GET", "/model/info").get("data", [])}
+        created = 0
+        for model in wanted:
+            name = model["model_name"]
+            if name in existing:
+                print(f"{name}: exists, left as it is (the Admin UI owns it)", flush=True)
+                continue
+            try:
+                result = call("POST", "/model/new", model)
+            except urllib.error.HTTPError as error:
+                sys.exit(f"{name}: LiteLLM refused /model/new with HTTP {error.code}: {error.read()[:500]!r}")
+            model_id = (result or {}).get("model_id") or (result or {}).get("model_info", {}).get("id")
+            print(f"{name}: created -> {model['litellm_params']['model']} (id {model_id})", flush=True)
+            created += 1
+        print(f"done: {created} created, {len(wanted) - created} already there", flush=True)
+
+
+    if __name__ == "__main__":
+        main()
+---
+# Creates the database models above that LiteLLM does not have yet, after every sync of moks-rag-stack (Argo CD
+# PostSync hook: it runs once LiteLLM is healthy, i.e. connected to its database). Idempotent: a model that exists is
+# never touched, so a sync never undoes a change made in the Admin UI. The previous run stays until the next sync
+# (BeforeHookCreation), so its log can be read:
+#   kubectl -n rag logs job/litellm-seed-models
+# Runs rag-api's image (Python, already on the nodes) with the script from the ConfigMap; the Istio sidecar gives it
+# the mesh's mTLS to LiteLLM (AuthorizationPolicy rag-internal-services admits namespace rag).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: litellm-seed-models
+  namespace: rag
+  labels:
+    app: litellm-seed-models
+    app.kubernetes.io/part-of: rag
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  backoffLimit: 2
+  activeDeadlineSeconds: 900
+  template:
+    metadata:
+      labels:
+        app: litellm-seed-models
+        app.kubernetes.io/part-of: rag
+    spec:
+      serviceAccountName: litellm
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: seed
+          image: ghcr.io/mrjithendar/moks-rag-api:latest
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-I", "/seed/seed_models.py"]
+          env:
+            - name: LITELLM_URL
+              value: "http://litellm.rag.svc.cluster.local:4000"
+            - name: SEED_FILE
+              value: /seed/models.json
+            - name: LITELLM_MASTER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: rag-secrets
+                  key: LITELLM_MASTER_KEY
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: seed
+              mountPath: /seed
+              readOnly: true
+      volumes:
+        - name: seed
+          configMap:
+            name: litellm-seed-models
