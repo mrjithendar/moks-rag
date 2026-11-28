@@ -341,8 +341,8 @@ Order matters. Each step leaves the running LiteLLM untouched until the last one
    EOF
    unset SALT PASS UIUSER
    ```
-   Then copy `LITELLM_SALT_KEY` and `LITELLM_UI_PASSWORD` into your password manager (`kubectl -n rag get secret rag-secrets -o jsonpath='{.data.LITELLM_SALT_KEY}' | base64 -d | pbcopy`). The salt key is the only way to read what LiteLLM stores; a database backup is useless without it.
-3. **Merge this repository's change.** Argo CD rolls LiteLLM: the new pod applies the database migrations (`prisma migrate deploy`, about 260 on an empty database) before serving, while the old pod keeps serving. Then add the models in the UI (above):
+   Then copy `LITELLM_SALT_KEY` into your password manager (`kubectl -n rag get secret rag-secrets -o jsonpath='{.data.LITELLM_SALT_KEY}' | base64 -d | pbcopy`). The salt key is the only way to read what LiteLLM stores; a database backup is useless without it.
+3. **Merge this repository's change.** Argo CD rolls LiteLLM: the new pod applies the database migrations (`prisma migrate deploy`, about 260 on an empty database) before serving, while the old pod keeps serving. Then create the first admin ("Accessing the Admin UI" below: the empty-database case) and add the models in the UI (above):
    ```bash
    kubectl -n rag rollout status deploy/litellm --timeout=10m
    ```
@@ -351,9 +351,39 @@ Until steps 1 and 2 are done, the new LiteLLM pod waits for its Secret keys (`Cr
 
 ### Accessing the Admin UI
 
-Open **https://jithendar.com/llm/ui/** and sign in with `LITELLM_UI_USERNAME` / `LITELLM_UI_PASSWORD` from `rag-secrets` (proxy admin). Read them with `kubectl -n rag get secret rag-secrets -o jsonpath='{.data.LITELLM_UI_PASSWORD}' | base64 -d | pbcopy`. A session lasts 24 hours (`LITELLM_UI_SESSION_DURATION` shortens it).
+Open **https://jithendar.com/llm/ui/** and sign in with **your own email and password**: a LiteLLM user with the role Admin (`proxy_admin`). A session lasts 24 hours (`LITELLM_UI_SESSION_DURATION` shortens it).
 
-The red **Environment-credential login is enabled** banner refers to exactly this sign-in. To retire it, create a proxy-admin user with a password in the UI (its users page, `/llm/ui/users/`), sign in as that user, then set `general_settings.disable_env_credential_login: true` in `litellm_config.yaml`. Do it in that order: the other way round nobody can sign in (the master key still works over the API).
+`LITELLM_UI_USERNAME` / `LITELLM_UI_PASSWORD` from `rag-secrets` no longer sign in, and neither does the master key: `general_settings.disable_env_credential_login: true` in `litellm_config.yaml` switched off that shared static secret, which made whoever held it a proxy admin (the red **Environment-credential login is enabled** banner). The Secret keys stay, so that removing the setting would bring back `UI_PASSWORD`, not the master key, as that password.
+
+**Adding an admin** (someone already signed in as an admin does this; the first one was made while the environment sign-in still worked):
+
+1. **Internal Users → Invite User**: the email, global proxy role **Admin**. *Create* shows an invitation link, `https://jithendar.com/llm/ui/onboarding?invitation_id=…`.
+2. Open it (in a private window if you are signed in as someone else) and set the password. LiteLLM's rules: at least 12 characters, with an upper-case and a lower-case letter, a digit and a special character. It also checks the password against Have I Been Pwned (only the first five characters of its SHA-1 leave the pod; when HIBP does not answer, the password is accepted).
+3. Sign in with that **email** (not a user name) and the password.
+
+An invitation link works once and expires after a week.
+
+On an empty database there is no admin to invite anyone: create the first one with the master key (`POST /llm/user/new` with `{"user_email": "…", "user_role": "proxy_admin", "auto_create_key": false}`), then give it a temporary password as below.
+
+**Lost password, or no admin can sign in:** the master key still works over the API. Set a temporary password for the user:
+
+```bash
+MASTER="$(kubectl -n rag get secret rag-secrets -o jsonpath='{.data.LITELLM_MASTER_KEY}' | base64 -d)"
+curl -s https://jithendar.com/llm/user/list -H "Authorization: Bearer $MASTER" \
+  | python3 -c 'import json,sys; [print(u["user_id"], u.get("user_email"), u.get("user_role")) for u in json.load(sys.stdin)["users"]]'
+```
+
+```bash
+TEMP="Aa1-$(openssl rand -hex 12)"
+curl -s -o /dev/null -w '%{http_code}\n' -X POST https://jithendar.com/llm/user/update \
+  -H "Authorization: Bearer $MASTER" -H 'Content-Type: application/json' -d @- <<EOF
+{"user_id": "<user_id from the list>", "password": "$TEMP"}
+EOF
+printf %s "$TEMP" | pbcopy
+unset MASTER TEMP
+```
+
+Expect `200`. Sign in with the email and the temporary password (on the clipboard); LiteLLM then requires a new one (`/llm/ui/change-password`) before the session can do anything else.
 
 The master key (`LITELLM_MASTER_KEY`) is for administration over the API only. Applications get virtual keys.
 
@@ -432,7 +462,7 @@ The callers' model names stay `moks-cms-default` and `moks-cms-fast`; only what 
 
 With more than one LiteLLM pod, the others pick the change up from PostgreSQL within 30 s. A sync of `moks-rag-stack` never undoes the switch: Git holds no models.
 
-rag-api's `claude-sonnet-5-5` and `claude-haiku-5-5` switch the same way (with the master key in step 6). What still needs Git and a restart: `general_settings` / `litellm_settings` in `litellm_config.yaml`, and the environment (`SERVER_ROOT_PATH`, keys, `UI_PASSWORD`). Before deleting a name in the UI, move its callers to another name.
+rag-api's `claude-sonnet-5-5` and `claude-haiku-5-5` switch the same way (with the master key in step 6). What still needs Git and a restart: `general_settings` / `litellm_settings` in `litellm_config.yaml`, and the environment (`SERVER_ROOT_PATH`, keys). For a `litellm_config.yaml` change, also change the pod annotation `rag.jithendar.com/litellm-config` in `deploy/k8s/litellm.yaml` in the same commit: Argo CD then rolls LiteLLM once by itself (a ConfigMap change alone restarts nothing). Before deleting a name in the UI, move its callers to another name.
 
 ### Redis (Valkey)
 
@@ -451,7 +481,7 @@ and in RedisInsight (https://jithendar.com/redis/, database 8): `litellm_config:
 ### Operational warnings
 
 - **`LITELLM_SALT_KEY` must never change.** It encrypts every model parameter and credential LiteLLM stores. With another salt key LiteLLM starts, but every UI-added model and credential silently disappears (they cannot be decrypted; tried on 1.112.0.dev2: `moks-cms-default` became "Invalid model name"). Virtual keys survive (they are hashed, not encrypted). Putting the old salt key back restores everything. Keep a copy outside the cluster; losing it means re-entering every model and credential.
-- **Rotating secrets:** `LITELLM_MASTER_KEY` signs UI sessions and is rag-api's LiteLLM key today, so rotating it signs everyone out and needs rag-api's restart too (`kubectl -n rag rollout restart deploy/litellm deploy/rag-api`). `LITELLM_UI_PASSWORD`: patch the Secret, restart LiteLLM. A virtual key: create a new one with the same models, patch the caller's Secret, then delete the old key. The database password belongs to Terraform (k8s-deployments); LiteLLM reads it at start.
+- **Rotating secrets:** `LITELLM_MASTER_KEY` signs UI sessions and is rag-api's LiteLLM key today, so rotating it signs everyone out and needs rag-api's restart too (`kubectl -n rag rollout restart deploy/litellm deploy/rag-api`). `LITELLM_UI_PASSWORD` no longer signs in (environment sign-in is off), so it needs no rotation. A UI user's password: they change it in the UI, or it is reset ("Accessing the Admin UI"). A virtual key: create a new one with the same models, patch the caller's Secret, then delete the old key. The database password belongs to Terraform (k8s-deployments); LiteLLM reads it at start.
 - **Backups:** the shared cluster has **no backups yet** (`postgres_backups` unset in k8s-deployments: no ScheduledBackup, the replica is not a backup). Until then, dump before upgrades and now and then:
   ```bash
   kubectl -n postgres-db exec postgres-cluster-1 -c postgres -- pg_dump -Fc -d litellm > litellm-$(date +%F).dump
@@ -475,7 +505,7 @@ Until the UI moves to its own host name (e.g. `llm.jithendar.com`, the lasting f
 | Pod `CreateContainerConfigError` | `kubectl -n rag describe pod -l app=litellm`: Secret `postgres-db-credentials` (k8s-deployments not applied) or a `rag-secrets` key missing |
 | Pod not Ready, `/health/readiness` 503 `"db":"disconnected"` | `kubectl -n postgres-db get cluster,pooler`; `kubectl -n postgres-db get database postgres-cluster-litellm`; LiteLLM's log for `P1001` (cannot reach) or `P1000` (password) |
 | Start-up exits after "Database migration cannot proceed" | `kubectl -n rag logs deploy/litellm --previous`; usually permissions: the role must own database `litellm` |
-| Sign-in says invalid credentials | the values in `rag-secrets` (`LITELLM_UI_USERNAME`/`PASSWORD`) as of the pod's start: patching the Secret needs `kubectl -n rag rollout restart deploy/litellm`. Repeated failures block that user name for a while (HTTP 429) |
+| Sign-in says invalid credentials | sign in with the user's **email**, not a user name, and their own password; `LITELLM_UI_USERNAME`/`PASSWORD` no longer work (`disable_env_credential_login`). Forgotten password: reset in "Accessing the Admin UI". Repeated failures block that user name for a while (HTTP 429) |
 | UI blank, or `/llm/ui/` shows the site's 404 | `curl -sI https://jithendar.com/llm/ui/` must carry `cache-control: no-store, no-transform` (set by the `litellm` VirtualService); if not, the edge delegate `llm` (k8s-deployments) is missing. LiteLLM's log must not say `Cannot apply server_root_path replacements` |
 | A model added in the UI is missing | `kubectl -n rag logs deploy/litellm | grep -i decrypt` (salt key changed?); two models with the same name? |
 | A caller gets "Invalid model name" | the name it asks for is not in **Models + Endpoints** (table above): add it in the UI |
