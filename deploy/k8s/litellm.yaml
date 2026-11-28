@@ -1,7 +1,8 @@
 # LiteLLM: the OpenAI-compatible proxy in front of the model providers, and its Admin UI at https://jithendar.com/llm/ui
 # (README "LiteLLM Admin UI"). Every model is added by hand in the Admin UI and kept in PostgreSQL (STORE_MODEL_IN_DB);
 # nothing in Git defines or creates one (litellm_config.yaml has no model_list). The callers' names must exist there:
-# claude-sonnet-5-5 and claude-haiku-5-5 (rag-api.yaml), moks-cms-default and moks-cms-fast (jithendar.com's team).
+# claude-sonnet-5-5 and claude-haiku-5-5 (rag-api.yaml), cms-claude-sonnet-latest and ops-claude-haiku-latest
+# (jithendar.com's team).
 # LiteLLM reloads database models every 30 s and at once in the pod that saved a change, so switching one needs no
 # restart and no change here.
 #

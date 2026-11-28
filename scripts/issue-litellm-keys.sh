@@ -58,7 +58,7 @@ import json, os, sys, urllib.parse, urllib.request
 URL, MASTER, ROTATE = os.environ["LITELLM_URL"].rstrip("/"), os.environ["MASTER"], os.environ["ROTATE"] == "1"
 TEAM = "jithendar.com"
 # Every alias moks-cms may ask for (D-110): LITELLM_MODEL, LITELLM_MODEL_FAST, the Opus tier, and AI visibility's.
-MODELS = ["moks-cms-default", "moks-cms-fast", "moks-cms-quality", "moks-cms-visibility-claude", "moks-cms-visibility-chatgpt", "moks-cms-visibility-perplexity", "moks-cms-visibility-gemini"]
+MODELS = ["cms-claude-sonnet-latest", "ops-claude-haiku-latest", "moks-cms-quality", "moks-cms-visibility-claude", "moks-cms-visibility-chatgpt", "moks-cms-visibility-perplexity", "moks-cms-visibility-gemini"]
 KEYS = [  # alias, Secret, Secret key
     ("jithendar-agent", "seo-agent-env", "LITELLM_API_KEY"),
     ("jithendar-ask", "seo-agent-env", "LITELLM_ASK_API_KEY"),
